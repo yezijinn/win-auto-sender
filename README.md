@@ -19,6 +19,12 @@
 
 ---
 
+## 界面预览 / Screenshot
+
+![软件主界面](docs/main-page.png)
+
+---
+
 ## 环境要求
 
 * **操作系统**：Windows 10 / Windows 11 (x64)
