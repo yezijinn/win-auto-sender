@@ -1,6 +1,12 @@
+# -*- coding: utf-8 -*-
+"""
+定时自动发送工具  -  现代版
+向指定窗口定时粘贴并发送内容，支持单次/循环、多提示词轮转
+"""
 import sys
 import time
 import datetime
+import random
 import ctypes
 from ctypes import wintypes
 import pyperclip
@@ -9,7 +15,7 @@ import win32process
 import win32con
 import win32api
 
-# 1. 解决高分屏/DPI缩放导致的点击错位 (必须在创建 QApplication 前调用)
+# ── DPI 感知（必须在 QApplication 之前） ──────────────────────
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
@@ -20,16 +26,21 @@ except Exception:
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QTextEdit, QComboBox, QRadioButton, QButtonGroup,
-    QDateEdit, QTimeEdit, QPushButton, QGroupBox, QGridLayout,
-    QStatusBar, QSpinBox, QMessageBox, QCheckBox
+    QLabel, QComboBox, QPushButton, QSpinBox, QMessageBox,
+    QListWidget, QListWidgetItem, QScrollArea, QPlainTextEdit,
+    QDateTimeEdit, QCheckBox, QFrame, QSizePolicy,
+    QTextEdit, QButtonGroup
 )
-from PySide6.QtCore import Qt, QTime, QDate, QThread, Signal
-from PySide6.QtGui import QFont, QCursor, QPainter, QPen, QColor, QKeyEvent
+from PySide6.QtCore import Qt, QTime, QDate, QDateTime, QThread, Signal, QTimer, QSize
+from PySide6.QtGui import QFont, QCursor, QPainter, QPen, QColor, QKeyEvent, QIcon, QPixmap, QBrush
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
+
+# ═══════════════════════════════════════════════════════════════
+#  工具函数
+# ═══════════════════════════════════════════════════════════════
 
 def is_admin():
     try:
@@ -42,17 +53,13 @@ def force_foreground_window(hwnd):
     """突破限制激活窗口焦点"""
     if not hwnd or not win32gui.IsWindow(hwnd):
         return False
-
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-
     current_tid = kernel32.GetCurrentThreadId()
     target_tid, _ = win32process.GetWindowThreadProcessId(hwnd)
-
     attached = False
     if current_tid != target_tid:
         attached = bool(user32.AttachThreadInput(current_tid, target_tid, True))
-
     try:
         win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
         win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
@@ -62,17 +69,15 @@ def force_foreground_window(hwnd):
     finally:
         if attached:
             user32.AttachThreadInput(current_tid, target_tid, False)
-
     time.sleep(0.15)
     return True
 
 
 def click_and_paste_send(hwnd, text, click_pos=None):
-    """点击 -> 剪贴板粘贴 -> 回车"""
+    """点击 → 剪贴板粘贴 → 回车"""
     try:
         if not force_foreground_window(hwnd):
             return False
-
         if click_pos and click_pos[0] > 0 and click_pos[1] > 0:
             x, y = click_pos
             user32.SetCursorPos(x, y)
@@ -81,17 +86,14 @@ def click_and_paste_send(hwnd, text, click_pos=None):
             time.sleep(0.05)
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             time.sleep(0.2)
-
         pyperclip.copy(text)
         time.sleep(0.05)
-
         win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
         win32api.keybd_event(ord('V'), 0, 0, 0)
         time.sleep(0.05)
         win32api.keybd_event(ord('V'), 0, win32con.KEYEVENTF_KEYUP, 0)
         win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
         time.sleep(0.15)
-
         win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
         time.sleep(0.05)
         win32api.keybd_event(win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0)
@@ -101,13 +103,413 @@ def click_and_paste_send(hwnd, text, click_pos=None):
         return False
 
 
-class TargetPickerLabel(QLabel):
+def list_all_windows():
+    """返回 [(title, hwnd), ...] 可见窗口列表"""
+    windows = []
+    def enum_cb(hwnd, extra):
+        if win32gui.IsWindowVisible(hwnd):
+            txt = win32gui.GetWindowText(hwnd)
+            if txt.strip():
+                windows.append((txt, hwnd))
+        return True
+    win32gui.EnumWindows(enum_cb, None)
+    windows.sort(key=lambda x: x[0].lower())
+    return windows
+
+
+def compute_fire_list(mode, start_dt, end_dt, interval_min, immediate, max_count=12):
+    """统一的「未来触发时间列表」计算函数——预览和 worker 共用同一套逻辑。
+    返回 list[datetime]，可能为空。
+    """
+    now = datetime.datetime.now()
+    if mode == 'single':
+        return [start_dt] if start_dt > now else []
+
+    interval = datetime.timedelta(minutes=interval_min)
+    if start_dt >= end_dt:
+        return []
+
+    # 首次触发
+    if immediate and now < end_dt:
+        first = now
+    else:
+        first = start_dt
+        if first <= now:
+            elapsed = (now - first).total_seconds()
+            steps = int(elapsed / interval.total_seconds()) + 1
+            first = first + interval * steps
+            if first > end_dt:
+                return []
+
+    if first > end_dt:
+        return []
+
+    result = []
+    t = first
+    while t <= end_dt and len(result) < max_count:
+        result.append(t)
+        t = t + interval
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  样式表
+# ═══════════════════════════════════════════════════════════════
+
+STYLE_SHEET = """
+/* ═════════  极光蓝深色主题  ═════════ */
+
+/* ===== 全局 ===== */
+QWidget {
+    font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+    font-size: 10pt;
+    color: #d6e4ff;
+    background-color: #0b1220;
+}
+QMainWindow {
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #0a1628, stop:0.5 #0b1c36, stop:1 #091524);
+}
+
+/* ===== 卡片 ===== */
+QFrame[class="card"] {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #122038, stop:1 #0e1a2e);
+    border: 1px solid #1f3560;
+    border-radius: 14px;
+}
+
+QLabel[class="card-title"] {
+    font-size: 12pt;
+    font-weight: 600;
+    color: #e0eeff;
+    padding: 0px;
+}
+
+QLabel[class="card-icon"] {
+    font-size: 14pt;
+}
+
+/* ===== 分段控件 ===== */
+QPushButton[class="seg-btn"] {
+    background-color: #0e1c33;
+    color: #7a93c0;
+    border: 1px solid #1f3560;
+    padding: 8px 22px;
+    font-weight: 500;
+}
+QPushButton[class="seg-btn-left"] {
+    border-top-left-radius: 8px;
+    border-bottom-left-radius: 8px;
+    border-right: none;
+}
+QPushButton[class="seg-btn-right"] {
+    border-top-right-radius: 8px;
+    border-bottom-right-radius: 8px;
+}
+QPushButton[class="seg-btn"][active="true"] {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #00b8ff, stop:1 #3d7bff);
+    color: #ffffff;
+    border-color: #00b8ff;
+}
+
+/* ===== 输入控件 ===== */
+QComboBox, QSpinBox, QDateTimeEdit {
+    background-color: #0e1c33;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+    padding: 6px 10px;
+    min-height: 20px;
+    color: #d6e4ff;
+    selection-background-color: #00b8ff;
+    selection-color: #06101e;
+}
+QComboBox:hover, QSpinBox:hover, QDateTimeEdit:hover {
+    border-color: #00b8ff;
+}
+QComboBox:focus, QSpinBox:focus, QDateTimeEdit:focus {
+    border-color: #00d4ff;
+    background-color: #122647;
+}
+QDateTimeEdit::drop-down {
+    border: none;
+    width: 24px;
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+}
+QComboBox::drop-down {
+    border: none;
+    width: 24px;
+}
+QComboBox QAbstractItemView {
+    background: #122647;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+    padding: 4px;
+    color: #d6e4ff;
+    selection-background-color: #1f3d7a;
+    selection-color: #ffffff;
+    outline: 0;
+}
+
+QCalendarWidget {
+    background-color: #122647;
+    color: #d6e4ff;
+    selection-background-color: #00b8ff;
+    selection-color: #06101e;
+}
+QCalendarWidget QToolButton {
+    color: #d6e4ff;
+    background: transparent;
+    border: none;
+}
+QCalendarWidget QMenu {
+    background: #122647;
+    color: #d6e4ff;
+}
+
+QPlainTextEdit, QTextEdit {
+    background-color: #0e1c33;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+    padding: 6px;
+    color: #d6e4ff;
+    selection-background-color: #00b8ff;
+    selection-color: #06101e;
+}
+QPlainTextEdit:focus, QTextEdit:focus {
+    border-color: #00d4ff;
+    background-color: #122647;
+}
+
+/* ===== 滚动条 ===== */
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 4px 0;
+}
+QScrollBar::handle:vertical {
+    background: #1f3560;
+    border-radius: 4px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #3d5d94;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+QScrollBar:horizontal {
+    background: transparent;
+    height: 8px;
+    margin: 0 4px;
+}
+QScrollBar::handle:horizontal {
+    background: #1f3560;
+    border-radius: 4px;
+    min-width: 30px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #3d5d94;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0;
+}
+
+/* ===== 按钮 ===== */
+QPushButton[class="btn-primary"] {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #00b8ff, stop:1 #3d7bff);
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-weight: 600;
+    font-size: 10.5pt;
+}
+QPushButton[class="btn-primary"]:hover {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #00d4ff, stop:1 #5a92ff);
+}
+QPushButton[class="btn-primary"]:pressed {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #00a0e0, stop:1 #2a6aff);
+}
+QPushButton[class="btn-primary"]:disabled {
+    background-color: #1f3560;
+    color: #5a7ab0;
+}
+
+QPushButton[class="btn-danger"] {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #ff6b8a, stop:1 #e84868);
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-weight: 600;
+    font-size: 10.5pt;
+}
+QPushButton[class="btn-danger"]:hover {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #ff8aa3, stop:1 #ff5c7a);
+}
+QPushButton[class="btn-danger"]:pressed {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #e85070, stop:1 #d43a58);
+}
+
+QPushButton[class="btn-secondary"] {
+    background-color: #132547;
+    color: #9cc0ff;
+    border: 1px solid #1f3560;
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-weight: 500;
+}
+QPushButton[class="btn-secondary"]:hover {
+    background-color: #1a3260;
+    border-color: #3d5d94;
+    color: #c2dbff;
+}
+QPushButton[class="btn-secondary"]:pressed {
+    background-color: #0f1e3a;
+}
+
+QPushButton[class="btn-ghost"] {
+    background-color: transparent;
+    color: #00d4ff;
+    border: 1px solid #00b8ff;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-weight: 500;
+}
+QPushButton[class="btn-ghost"]:hover {
+    background-color: rgba(0, 184, 255, 0.15);
+}
+
+QPushButton[class="btn-icon-del"] {
+    background-color: #2a1a2e;
+    color: #ff6b8a;
+    border: 1px solid #4a2538;
+    border-radius: 4px;
+    font-weight: bold;
+}
+QPushButton[class="btn-icon-del"]:hover {
+    background-color: #3d1f2b;
+    border-color: #ff6b8a;
+}
+
+/* ===== 列表 ===== */
+QListWidget {
+    background-color: #0e1c33;
+    border: 1px solid #1f3560;
+    border-radius: 8px;
+    padding: 4px;
+    outline: 0;
+    color: #d6e4ff;
+}
+QListWidget::item {
+    padding: 8px 10px;
+    border-radius: 4px;
+    margin: 2px 0;
+}
+QListWidget::item:selected {
+    background-color: #1f3d7a;
+    color: #ffffff;
+}
+
+/* ===== 拖拽准星 ===== */
+QFrame[class="picker-box"] {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #0a1f3d, stop:1 #0e2a52);
+    border: 2px dashed #00b8ff;
+    border-radius: 10px;
+}
+
+/* ===== 复选框 ===== */
+QCheckBox {
+    spacing: 8px;
+    color: #b8ccf0;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 2px solid #3d5d94;
+    border-radius: 4px;
+    background: #0e1c33;
+}
+QCheckBox::indicator:hover {
+    border-color: #00b8ff;
+}
+QCheckBox::indicator:checked {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #00b8ff, stop:1 #3d7bff);
+    border-color: #00d4ff;
+}
+
+/* ===== 状态文字（纯文字，无背景填充） ===== */
+QLabel[class="status-pill"] {
+    padding: 2px 4px;
+    font-weight: 600;
+    font-size: 10pt;
+}
+QLabel[class="status-pill"][state="idle"] {
+    color: #7a93c0;
+}
+QLabel[class="status-pill"][state="running"] {
+    color: #3dffa8;
+}
+QLabel[class="status-pill"][state="error"] {
+    color: #ff8aa3;
+}
+QLabel[class="status-pill"][state="done"] {
+    color: #5ad4ff;
+}
+
+/* ===== 倒计时 ===== */
+QLabel[class="countdown"] {
+    font-size: 22pt;
+    font-weight: 700;
+    color: #00d4ff;
+    font-family: "Consolas", "Courier New", monospace;
+}
+QLabel[class="countdown-label"] {
+    font-size: 9pt;
+    color: #7a93c0;
+}
+
+/* ===== 日志 ===== */
+QTextEdit[class="log-view"] {
+    background-color: #06101e;
+    color: #9cc0ff;
+    border: 1px solid #1f3560;
+    border-radius: 8px;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 9pt;
+}
+
+/* ===== 标题文字 ===== */
+QLabel#header-title {
+    font-size: 15pt;
+    font-weight: 700;
+    color: #ffffff;
+}
+"""
+
+
+# ═══════════════════════════════════════════════════════════════
+#  拖拽准星控件
+# ═══════════════════════════════════════════════════════════════
+
+class TargetPickerLabel(QFrame):
     targetCaptured = Signal(int, int, int, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(50, 50)
-        self.setStyleSheet("border: 2px dashed #007acc; background-color: #f0f8ff; border-radius: 6px;")
+        self.setProperty("class", "picker-box")
+        self.setFixedSize(140, 90)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dragging = False
 
@@ -115,13 +517,23 @@ class TargetPickerLabel(QLabel):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor("#007acc"), 2)
+
+        # 准星
+        cx, cy = self.width() // 2, 34
+        pen = QPen(QColor("#00d4ff"), 2)
         painter.setPen(pen)
-        cx, cy = self.width() // 2, self.height() // 2
-        r = 12
+        r = 14
         painter.drawEllipse(cx - r, cy - r, r * 2, r * 2)
-        painter.drawLine(cx - r - 5, cy, cx + r + 5, cy)
-        painter.drawLine(cx, cy - r - 5, cx, cy + r + 5)
+        painter.drawLine(cx - r - 6, cy, cx + r + 6, cy)
+        painter.drawLine(cx, cy - r - 6, cx, cy + r + 6)
+
+        # 文字
+        painter.setPen(QColor("#00d4ff"))
+        font = painter.font()
+        font.setPointSize(8)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(self.rect().adjusted(0, 55, 0, -8), Qt.AlignmentFlag.AlignCenter, "按住拖向目标窗口")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -134,17 +546,14 @@ class TargetPickerLabel(QLabel):
             pt = wintypes.POINT()
             user32.GetCursorPos(ctypes.byref(pt))
             x, y = pt.x, pt.y
-
             sub_hwnd = user32.WindowFromPoint(pt)
             hwnd = win32gui.GetAncestor(sub_hwnd, win32con.GA_ROOT)
             if not hwnd:
                 hwnd = sub_hwnd
-
             title = win32gui.GetWindowText(hwnd) if hwnd else ""
             self.targetCaptured.emit(hwnd, x, y, title)
 
     def keyPressEvent(self, event: QKeyEvent):
-        # 按 ESC 取消瞄准拖拽，防止卡死
         if event.key() == Qt.Key.Key_Escape and self.dragging:
             self._finish_drag()
 
@@ -158,237 +567,528 @@ class TargetPickerLabel(QLabel):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
 
+# ═══════════════════════════════════════════════════════════════
+#  调度线程
+# ═══════════════════════════════════════════════════════════════
+
 class SchedulerWorker(QThread):
     log_signal = Signal(str)
-    task_done_signal = Signal()
+    status_signal = Signal(str)       # idle / running / done
+    next_fire_signal = Signal(object)  # datetime or None
 
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.prompts = config['prompts']
+        self.strategy = config['strategy']
+        self.prompt_index = 0
+
+    def pick_prompt(self):
+        if not self.prompts:
+            return ''
+        if self.strategy == 'random':
+            return random.choice(self.prompts)
+        p = self.prompts[self.prompt_index % len(self.prompts)]
+        self.prompt_index = (self.prompt_index + 1) % len(self.prompts)
+        return p
+
+    def _next_fire(self, last_fire):
+        mode = self.config['mode']
+        if mode == 'single':
+            return None
+        interval = datetime.timedelta(minutes=self.config['interval_min'])
+        nxt = last_fire + interval
+        if nxt > self.config['end_dt']:
+            return None
+        return nxt
 
     def run(self):
         hwnd = self.config['hwnd']
-        prompt = self.config['prompt']
-        mode = self.config['mode']
-        start_date = self.config['start_date']
-        end_date = self.config['end_date']
-        trigger_time = self.config['trigger_time']
-        interval_sec = self.config['interval_min'] * 60
         click_pos = self.config['click_pos']
+        mode = self.config['mode']
+        start_dt = self.config['start_dt']
+        end_dt = self.config['end_dt']
+        immediate = self.config.get('run_immediately', False)
 
-        has_triggered = False
-        last_loop_time = time.time() if not self.config.get('run_immediately', False) else 0
+        now = datetime.datetime.now()
 
-        self.log_signal.emit("监听调度引擎已就绪...")
+        # 计算首次触发
+        if mode == 'single':
+            next_fire = start_dt
+        else:
+            if immediate and now < end_dt:
+                next_fire = now
+            else:
+                next_fire = start_dt
+                if next_fire <= now:
+                    interval = datetime.timedelta(minutes=self.config['interval_min'])
+                    elapsed = (now - next_fire).total_seconds()
+                    steps = int(elapsed / interval.total_seconds()) + 1
+                    next_fire = next_fire + interval * steps
+                    if next_fire > end_dt:
+                        next_fire = None
+
+        if next_fire is None:
+            self.log_signal.emit("已超出有效时间范围，无任务可执行。")
+            self.status_signal.emit("done")
+            return
+
+        self.status_signal.emit("running")
+        self.next_fire_signal.emit(next_fire)
+        self.log_signal.emit(f"调度已启动，首次触发：{next_fire.strftime('%Y-%m-%d %H:%M:%S')}")
 
         while not self.isInterruptionRequested():
             now = datetime.datetime.now()
-            today = now.date()
+            if now >= next_fire:
+                self.log_signal.emit("⏰ 触发 — 正在聚焦并发送...")
+                ok = click_and_paste_send(hwnd, self.pick_prompt(), click_pos)
+                self.log_signal.emit("✅ 发送成功。" if ok else "❌ 发送失败。")
 
-            if not (start_date <= today <= end_date):
-                time.sleep(0.5)
-                continue
-
-            if mode == 'single':
-                target_dt = datetime.datetime.combine(today, trigger_time)
-                if now >= target_dt and not has_triggered:
-                    self.log_signal.emit("定时到达，正在聚焦并发送...")
-                    ok = click_and_paste_send(hwnd, prompt, click_pos)
-                    has_triggered = True
-                    self.log_signal.emit("单次任务执行成功。" if ok else "单次任务执行失败。")
-                    self.task_done_signal.emit()
+                next_fire = self._next_fire(next_fire)
+                if next_fire is None:
+                    self.log_signal.emit("🏁 全部任务已完成，调度结束。")
                     break
+                self.next_fire_signal.emit(next_fire)
+                self.log_signal.emit(f"⏭️  下次触发：{next_fire.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            elif mode == 'loop':
-                current_epoch = time.time()
-                if current_epoch - last_loop_time >= interval_sec:
-                    self.log_signal.emit("周期触发，正在发送提示词...")
-                    click_and_paste_send(hwnd, prompt, click_pos)
-                    last_loop_time = current_epoch
-                    self.log_signal.emit(f"已执行，等待下个周期 ({self.config['interval_min']} 分钟后)...")
-
-            for _ in range(5):
+            for _ in range(10):
                 if self.isInterruptionRequested():
                     break
                 time.sleep(0.1)
 
-        self.log_signal.emit("任务调度已完全停止。")
+        self.status_signal.emit("done")
+        self.next_fire_signal.emit(None)
+        self.log_signal.emit("调度已停止。")
 
+
+# ═══════════════════════════════════════════════════════════════
+#  主窗口
+# ═══════════════════════════════════════════════════════════════
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        title_suffix = " (管理员)" if is_admin() else ""
-        self.setWindowTitle(f"定时自动发送工具  -  作者 https://github.com/yezijinn{title_suffix}")
-        self.setMinimumSize(580, 700)
+        title = "定时自动发送工具"
+        if is_admin():
+            title += "  ·  管理员模式"
+        self.setWindowTitle(title)
+        self.setMinimumSize(900, 560)
+        self.resize(1040, 720)
 
         self.worker = None
-        self.init_ui()
-        self.refresh_window_list()
+        self.prompt_cards = []
+        self.next_fire_time = None  # 用于倒计时显示
+
+        self._setup_style()
+        self._init_ui()
+        self._refresh_window_list()
+        self.add_prompt_card()
+        self._on_mode_changed()
+        self._refresh_schedule_preview()
+
+        # 每秒刷新：当前时间 + 倒计时 +（非运行时）预览
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._on_tick)
+        self._timer.start(1000)
 
         if not is_admin():
-            self.status_bar.showMessage("提示: 未使用管理员权限运行，若目标窗口具有高权限可能无法键入", 8000)
+            self._append_log("⚠️  未使用管理员权限运行，若目标窗口具有高权限可能无法键入。")
 
-    def init_ui(self):
+    # ── 样式 ────────────────────────────────────────────────
+
+    def _setup_style(self):
+        self.setStyleSheet(STYLE_SHEET)
+
+    @staticmethod
+    def _card(title_text, icon_text=""):
+        """创建一张卡片，返回 (card_frame, content_layout, title_bar)"""
+        card = QFrame()
+        card.setProperty("class", "card")
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(16, 14, 16, 14)
+        outer.setSpacing(12)
+
+        # 标题栏
+        title_bar = QHBoxLayout()
+        title_bar.setSpacing(8)
+        if icon_text:
+            icon_lbl = QLabel(icon_text)
+            icon_lbl.setProperty("class", "card-icon")
+            title_bar.addWidget(icon_lbl)
+        title_lbl = QLabel(title_text)
+        title_lbl.setProperty("class", "card-title")
+        title_bar.addWidget(title_lbl)
+        title_bar.addStretch()
+        outer.addLayout(title_bar)
+
+        content = QVBoxLayout()
+        content.setSpacing(8)
+        outer.addLayout(content)
+        return card, content, title_bar
+
+    # ── UI 构建 ─────────────────────────────────────────────
+
+    def _init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setSpacing(10)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(10)
 
-        # 1. 窗口绑定
-        win_group = QGroupBox("1. 目标窗口绑定")
-        win_layout = QHBoxLayout(win_group)
-        self.win_combo = QComboBox()
-        self.win_combo.setMinimumWidth(320)
-        btn_refresh = QPushButton("刷新列表")
-        btn_refresh.clicked.connect(self.refresh_window_list)
+        # ─── 顶部状态栏 ───
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        title_lbl = QLabel("⏱️  定时自动发送")
+        title_lbl.setStyleSheet("font-size: 15pt; font-weight: 700; color: #ffffff;")
+        header.addWidget(title_lbl)
+        header.addStretch()
+
+        self.lbl_now = QLabel()
+        self.lbl_now.setStyleSheet("color: #7a93c0; font-size: 9.5pt;")
+        header.addWidget(self.lbl_now)
+
+        self.status_pill = QLabel("● 待命中")
+        self.status_pill.setProperty("class", "status-pill")
+        self.status_pill.setProperty("state", "idle")
+        self.status_pill.setStyle(self.style())  # 刷新属性
+        header.addWidget(self.status_pill)
+
+        root.addLayout(header)
+
+        # ─── 主体内容放入滚动区，避免任何控件被挤压重叠 ───
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        scroll_body = QWidget()
+        scroll_layout = QHBoxLayout(scroll_body)
+        scroll_layout.setContentsMargins(0, 2, 6, 4)
+        scroll_layout.setSpacing(12)
+        scroll.setWidget(scroll_body)
+
+        # === 左列 ===
+        left = QVBoxLayout()
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(12)
+
+        # 目标卡片
+        target_card, target_layout, _ = self._card("目标窗口", "🎯")
+        self._build_target_card(target_layout)
+        left.addWidget(target_card)
+
+        # 内容卡片
+        content_card, content_layout, _ = self._card("发送内容", "📝")
+        self._build_content_card(content_layout)
+        left.addWidget(content_card)
+
+        scroll_layout.addLayout(left, 1)
+
+        # === 右列 ===
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(12)
+
+        # 计划卡片
+        sched_card, sched_layout, _ = self._card("发送计划", "⏰")
+        self._build_schedule_card(sched_layout)
+        right.addWidget(sched_card)
+
+        # 倒计时卡片
+        cd_card, cd_layout, _ = self._card("距下次触发", "⏳")
+        self._build_countdown_card(cd_layout)
+        right.addWidget(cd_card)
+
+        # 日志卡片
+        log_card, log_layout, _ = self._card("运行日志", "📋")
+        self._build_log_card(log_layout)
+        right.addWidget(log_card)
+
+        scroll_layout.addLayout(right, 1)
+
+        root.addWidget(scroll, 1)
+
+        # ─── 底部操作栏（固定在窗口底部，不进滚动区） ───
+        bar = QHBoxLayout()
+        bar.setSpacing(10)
+
+        self.btn_toggle = QPushButton("▶  启动定时")
+        self.btn_toggle.setProperty("class", "btn-primary")
+        self.btn_toggle.setMinimumHeight(44)
+        self.btn_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle.clicked.connect(self.toggle_task)
+        bar.addWidget(self.btn_toggle, 2)
+
+        btn_test = QPushButton("⚡  立即测试")
+        btn_test.setProperty("class", "btn-secondary")
+        btn_test.setMinimumHeight(44)
+        btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_test.clicked.connect(self.test_trigger)
+        bar.addWidget(btn_test, 1)
+
+        btn_refresh = QPushButton("🔄  刷新预览")
+        btn_refresh.setProperty("class", "btn-secondary")
+        btn_refresh.setMinimumHeight(44)
+        btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_refresh.clicked.connect(self._refresh_schedule_preview)
+        bar.addWidget(btn_refresh, 1)
+
+        root.addLayout(bar)
+
+    def _build_target_card(self, layout):
+        # 拖拽 + 下拉
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
 
         self.picker_label = TargetPickerLabel()
-        self.picker_label.targetCaptured.connect(self.on_target_captured)
+        self.picker_label.targetCaptured.connect(self._on_target_captured)
+        row1.addWidget(self.picker_label)
 
-        picker_box = QVBoxLayout()
-        picker_box.addWidget(self.picker_label)
-        picker_hint = QLabel("按住拖向目标")
-        picker_hint.setStyleSheet("font-size: 10px; color: gray;")
-        picker_box.addWidget(picker_hint)
+        right_col = QVBoxLayout()
+        right_col.setSpacing(6)
 
-        win_layout.addWidget(QLabel("目标窗口:"))
-        win_layout.addWidget(self.win_combo, 1)
-        win_layout.addWidget(btn_refresh)
-        win_layout.addLayout(picker_box)
-        layout.addWidget(win_group)
+        self.win_combo = QComboBox()
+        self.win_combo.setMinimumWidth(200)
+        self.win_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        btn_win_refresh = QPushButton("🔄 刷新")
+        btn_win_refresh.setProperty("class", "btn-secondary")
+        btn_win_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_win_refresh.clicked.connect(self._refresh_window_list)
 
-        # 2. 坐标
-        coord_group = QGroupBox("2. 自动点击坐标（防焦点丢失）")
-        coord_layout = QHBoxLayout(coord_group)
+        combo_row = QHBoxLayout()
+        combo_row.addWidget(self.win_combo, 1)
+        combo_row.addWidget(btn_win_refresh)
+        right_col.addLayout(combo_row)
+
+        # 坐标
+        coord_row = QHBoxLayout()
         self.spin_x = QSpinBox()
         self.spin_x.setRange(0, 9999)
-        self.spin_x.setPrefix("屏幕 X: ")
+        self.spin_x.setPrefix("X: ")
         self.spin_y = QSpinBox()
         self.spin_y.setRange(0, 9999)
-        self.spin_y.setPrefix("屏幕 Y: ")
-
+        self.spin_y.setPrefix("Y: ")
         btn_clear_coord = QPushButton("清空坐标")
+        btn_clear_coord.setProperty("class", "btn-secondary")
+        btn_clear_coord.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_clear_coord.clicked.connect(lambda: (self.spin_x.setValue(0), self.spin_y.setValue(0)))
+        coord_row.addWidget(self.spin_x)
+        coord_row.addWidget(self.spin_y)
+        coord_row.addWidget(btn_clear_coord)
+        coord_row.addStretch()
+        right_col.addLayout(coord_row)
 
-        coord_layout.addWidget(self.spin_x)
-        coord_layout.addWidget(self.spin_y)
-        coord_layout.addWidget(btn_clear_coord)
-        coord_layout.addWidget(QLabel("（拖动上方准星到目标输入框松开即可）"))
-        coord_layout.addStretch()
-        layout.addWidget(coord_group)
+        row1.addLayout(right_col, 1)
+        layout.addLayout(row1)
 
-# 3. 提示词
-        prompt_group = QGroupBox("3. 预设提示词文本")
-        p_layout = QVBoxLayout(prompt_group)
-        self.txt_prompt = QTextEdit()
-        
-        # 默认新手指南（替换原有 setPlaceholderText 行）
-        default_guide = (
-            "请清空此处的指南文本，在此处输入你要发送的内容...\n"
-            "1. 权限说明：建议右键本软件“以管理员身份运行”，避免因 Windows 权限隔离导致无法向 CMD、终端或某些 IDE 写入。\n"
-            "2. 绑定窗口与焦点：\n"
-            "   - 方法 A（推荐）：按住右上角的【准星图标】不放，拖拽到目标窗口的输入框中央，松开鼠标即可自动绑定窗口并记录点击坐标。\n"
-            "   - 方法 B：在下拉框中手动挑选目标窗口，或直接使用坐标清空模式。\n"
-            "3. 策略设置：\n"
-            "   - 单次任务：在到达指定的【触发时间】时自动发送一次并停止。\n"
-            "   - 循环任务：按设定的【循环间隔(分钟)】持续定时发送。\n"
-            "4. 运行与验证：\n"
-            "   - 可先点【立即测试触发 1 次】检验目标窗口是否能正常激活、粘贴并发送。\n"
-            "   - 确认无误后点击【启动定时监听】挂机即可。\n"
+        hint = QLabel("💡 按住左侧准星拖到目标窗口的输入框上松开，可自动绑定窗口并记录点击坐标。")
+        hint.setStyleSheet("color: #7a93c0; font-size: 8.5pt;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
-        )
-        self.txt_prompt.setPlainText(default_guide)
-        
-        p_layout.addWidget(self.txt_prompt)
-        layout.addWidget(prompt_group)
+    def _build_content_card(self, layout):
+        # 滚动区
+        self.prompt_scroll = QScrollArea()
+        self.prompt_scroll.setWidgetResizable(True)
+        self.prompt_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.prompt_container = QWidget()
+        self.prompt_list_layout = QVBoxLayout(self.prompt_container)
+        self.prompt_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.prompt_list_layout.setSpacing(6)
+        self.prompt_list_layout.addStretch()
+        self.prompt_scroll.setWidget(self.prompt_container)
+        self.prompt_scroll.setMinimumHeight(180)
+        layout.addWidget(self.prompt_scroll, 1)
 
-        # 4. 触发策略
-        time_group = QGroupBox("4. 时间与触发策略")
-        t_layout = QGridLayout(time_group)
+        # 底部操作行
+        bottom = QHBoxLayout()
+        bottom.setSpacing(10)
 
-        self.rb_single = QRadioButton("单次任务")
-        self.rb_loop = QRadioButton("循环任务")
-        self.rb_single.setChecked(True)
-        bg = QButtonGroup(self)
-        bg.addButton(self.rb_single)
-        bg.addButton(self.rb_loop)
+        btn_add = QPushButton("➕ 添加一条")
+        btn_add.setProperty("class", "btn-ghost")
+        btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_add.clicked.connect(lambda: self.add_prompt_card())
+        bottom.addWidget(btn_add)
 
-        t_layout.addWidget(QLabel("任务模式:"), 0, 0)
-        t_layout.addWidget(self.rb_single, 0, 1)
-        t_layout.addWidget(self.rb_loop, 0, 2)
+        bottom.addSpacing(10)
+        bottom.addWidget(QLabel("策略:"))
+        self.combo_strategy = QComboBox()
+        self.combo_strategy.addItem("顺序循环")
+        self.combo_strategy.addItem("随机发送")
+        bottom.addWidget(self.combo_strategy)
 
-        t_layout.addWidget(QLabel("触发时间 (单次):"), 1, 0)
-        self.time_picker = QTimeEdit()
-        self.time_picker.setDisplayFormat("HH:mm:ss")
-        self.time_picker.setTime(QTime.currentTime().addSecs(60))
-        t_layout.addWidget(self.time_picker, 1, 1)
+        bottom.addStretch()
+        self.lbl_prompt_count = QLabel("共 0 条")
+        self.lbl_prompt_count.setStyleSheet("color: #7a93c0; font-size: 9pt;")
+        bottom.addWidget(self.lbl_prompt_count)
 
-        t_layout.addWidget(QLabel("循环间隔 (分钟):"), 1, 2)
+        layout.addLayout(bottom)
+
+    def _build_schedule_card(self, layout):
+        # 分段控件：单次 / 循环
+        seg_row = QHBoxLayout()
+        seg_row.addStretch()
+
+        self.btn_seg_single = QPushButton("单次")
+        self.btn_seg_single.setProperty("class", "seg-btn seg-btn-left")
+        self.btn_seg_single.setProperty("active", True)
+        self.btn_seg_single.setCheckable(True)
+        self.btn_seg_single.setChecked(True)
+        self.btn_seg_single.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_seg_single.clicked.connect(lambda: self._set_mode("single"))
+
+        self.btn_seg_loop = QPushButton("循环")
+        self.btn_seg_loop.setProperty("class", "seg-btn seg-btn-right")
+        self.btn_seg_loop.setProperty("active", False)
+        self.btn_seg_loop.setCheckable(True)
+        self.btn_seg_loop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_seg_loop.clicked.connect(lambda: self._set_mode("loop"))
+
+        seg_group = QButtonGroup(self)
+        seg_group.addButton(self.btn_seg_single)
+        seg_group.addButton(self.btn_seg_loop)
+        seg_group.setExclusive(True)
+
+        seg_row.addWidget(self.btn_seg_single)
+        seg_row.addWidget(self.btn_seg_loop)
+        seg_row.addStretch()
+        layout.addLayout(seg_row)
+
+        # —— 单次面板 ——
+        self.single_panel = QWidget()
+        sp = QVBoxLayout(self.single_panel)
+        sp.setContentsMargins(2, 6, 2, 4)
+        sp.setSpacing(10)
+
+        label1 = QLabel("触发时间")
+        label1.setStyleSheet("color: #7a93c0; font-size: 9pt; font-weight: 500;")
+        sp.addWidget(label1)
+
+        self.single_dt = QDateTimeEdit(QDateTime.currentDateTime().addSecs(60))
+        self.single_dt.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
+        self.single_dt.setCalendarPopup(True)
+        self.single_dt.setMinimumHeight(30)
+        sp.addWidget(self.single_dt)
+
+        s_hint = QLabel("到点自动发送一次，然后停止 · 时间已过会在启动时询问是否顺延")
+        s_hint.setStyleSheet("color: #5a7ab0; font-size: 8.5pt;")
+        s_hint.setWordWrap(True)
+        sp.addWidget(s_hint)
+
+        layout.addWidget(self.single_panel)
+
+        # —— 循环面板 ——
+        self.loop_panel = QWidget()
+        lp = QVBoxLayout(self.loop_panel)
+        lp.setContentsMargins(2, 6, 2, 4)
+        lp.setSpacing(10)
+
+        # 开始
+        label2 = QLabel("开始时间")
+        label2.setStyleSheet("color: #7a93c0; font-size: 9pt; font-weight: 500;")
+        lp.addWidget(label2)
+        self.loop_start_dt = QDateTimeEdit(QDateTime.currentDateTime().addSecs(60))
+        self.loop_start_dt.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
+        self.loop_start_dt.setCalendarPopup(True)
+        self.loop_start_dt.setMinimumHeight(30)
+        lp.addWidget(self.loop_start_dt)
+
+        # 结束
+        label3 = QLabel("结束时间")
+        label3.setStyleSheet("color: #7a93c0; font-size: 9pt; font-weight: 500;")
+        lp.addWidget(label3)
+        self.loop_end_dt = QDateTimeEdit(QDateTime.currentDateTime().addDays(7))
+        self.loop_end_dt.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
+        self.loop_end_dt.setCalendarPopup(True)
+        self.loop_end_dt.setMinimumHeight(30)
+        lp.addWidget(self.loop_end_dt)
+
+        # 间隔 + 立即
+        opt_row = QHBoxLayout()
+        opt_row.setSpacing(8)
+        opt_row.addWidget(QLabel("间隔:"))
         self.spin_interval = QSpinBox()
         self.spin_interval.setRange(1, 1440)
         self.spin_interval.setValue(10)
-        self.spin_interval.setEnabled(False)
-        t_layout.addWidget(self.spin_interval, 1, 3)
+        self.spin_interval.setSuffix(" 分钟")
+        self.spin_interval.setMinimumHeight(30)
+        opt_row.addWidget(self.spin_interval)
+        opt_row.addSpacing(12)
+        self.chk_immediate = QCheckBox("启动时立即发第 1 次")
+        opt_row.addWidget(self.chk_immediate)
+        opt_row.addStretch()
+        lp.addLayout(opt_row)
 
-        self.chk_immediate = QCheckBox("循环启动时立即执行第 1 次")
-        self.chk_immediate.setEnabled(False)
-        t_layout.addWidget(self.chk_immediate, 2, 2, 1, 2)
+        layout.addWidget(self.loop_panel)
 
-        self.rb_single.toggled.connect(self.toggle_mode_ui)
+        # 分隔线
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet("color: #1f3560;")
+        layout.addWidget(line)
 
-        t_layout.addWidget(QLabel("有效开始日期:"), 3, 0)
-        self.date_start = QDateEdit(QDate.currentDate())
-        self.date_start.setCalendarPopup(True)
-        t_layout.addWidget(self.date_start, 3, 1)
+        # 预览标题
+        pv_title = QLabel("接下来的触发时间")
+        pv_title.setStyleSheet("color: #7a93c0; font-size: 9pt; font-weight: 500;")
+        layout.addWidget(pv_title)
 
-        t_layout.addWidget(QLabel("有效截止日期:"), 3, 2)
-        self.date_end = QDateEdit(QDate.currentDate().addDays(7))
-        self.date_end.setCalendarPopup(True)
-        t_layout.addWidget(self.date_end, 3, 3)
-        layout.addWidget(time_group)
+        self.list_schedule = QListWidget()
+        self.list_schedule.setMinimumHeight(110)
+        self.list_schedule.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        layout.addWidget(self.list_schedule)
 
-        # 5. 控制按钮
-        btn_layout = QHBoxLayout()
-        self.btn_toggle = QPushButton("▶ 启动定时监听")
-        self.btn_toggle.setFixedHeight(42)
-        self.btn_toggle.setStyleSheet("font-size: 14px; font-weight: bold;")
-        self.btn_toggle.clicked.connect(self.toggle_task)
+        # 连接所有变化信号
+        self.single_dt.dateTimeChanged.connect(self._refresh_schedule_preview)
+        self.loop_start_dt.dateTimeChanged.connect(self._refresh_schedule_preview)
+        self.loop_end_dt.dateTimeChanged.connect(self._refresh_schedule_preview)
+        self.spin_interval.valueChanged.connect(self._refresh_schedule_preview)
+        self.chk_immediate.toggled.connect(self._refresh_schedule_preview)
 
-        btn_test = QPushButton("⚡ 立即测试触发 1 次")
-        btn_test.setFixedHeight(42)
-        btn_test.clicked.connect(self.test_trigger)
+    def _build_countdown_card(self, layout):
+        self.lbl_countdown = QLabel("--:--:--")
+        self.lbl_countdown.setProperty("class", "countdown")
+        self.lbl_countdown.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.lbl_countdown)
 
-        btn_layout.addWidget(self.btn_toggle, 2)
-        btn_layout.addWidget(btn_test, 1)
-        layout.addLayout(btn_layout)
+        self.lbl_countdown_label = QLabel("等待启动...")
+        self.lbl_countdown_label.setProperty("class", "countdown-label")
+        self.lbl_countdown_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.lbl_countdown_label)
 
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("就绪")
+    def _build_log_card(self, layout):
+        self.log_view = QTextEdit()
+        self.log_view.setProperty("class", "log-view")
+        self.log_view.setReadOnly(True)
+        self.log_view.setMinimumHeight(120)
+        layout.addWidget(self.log_view)
 
-    def toggle_mode_ui(self, is_single):
-        self.spin_interval.setEnabled(not is_single)
-        self.chk_immediate.setEnabled(not is_single)
+    # ── 模式切换 ─────────────────────────────────────────────
 
-    def refresh_window_list(self):
+    def _set_mode(self, mode):
+        is_single = (mode == "single")
+        self.btn_seg_single.setProperty("active", is_single)
+        self.btn_seg_loop.setProperty("active", not is_single)
+        self.btn_seg_single.style().unpolish(self.btn_seg_single)
+        self.btn_seg_single.style().polish(self.btn_seg_single)
+        self.btn_seg_loop.style().unpolish(self.btn_seg_loop)
+        self.btn_seg_loop.style().polish(self.btn_seg_loop)
+
+        self.single_panel.setVisible(is_single)
+        self.loop_panel.setVisible(not is_single)
+        self._refresh_schedule_preview()
+
+    def _on_mode_changed(self):
+        # 初始化时根据默认选中状态设置面板可见性
+        self._set_mode("single")
+
+    # ── 窗口列表 ─────────────────────────────────────────────
+
+    def _refresh_window_list(self):
         self.win_combo.clear()
-        windows = []
+        for title, hwnd in list_all_windows():
+            self.win_combo.addItem(f"{title}", hwnd)
 
-        def enum_cb(hwnd, extra):
-            if win32gui.IsWindowVisible(hwnd):
-                txt = win32gui.GetWindowText(hwnd)
-                if txt.strip():
-                    windows.append((txt, hwnd))
-            return True
-
-        win32gui.EnumWindows(enum_cb, None)
-        windows.sort(key=lambda x: x[0].lower())
-
-        for title, hwnd in windows:
-            self.win_combo.addItem(f"{title} (HWND:{hwnd})", hwnd)
-
-    def on_target_captured(self, hwnd, x, y, title):
+    def _on_target_captured(self, hwnd, x, y, title):
         self.spin_x.setValue(x)
         self.spin_y.setValue(y)
 
@@ -397,99 +1097,302 @@ class MainWindow(QMainWindow):
             if self.win_combo.itemData(i) == hwnd:
                 idx = i
                 break
-
         if idx != -1:
             self.win_combo.setCurrentIndex(idx)
         else:
-            self.win_combo.insertItem(0, f"[捕获] {title} (HWND:{hwnd})", hwnd)
+            self.win_combo.insertItem(0, title, hwnd)
             self.win_combo.setCurrentIndex(0)
 
-        self.status_bar.showMessage(f"已锁定坐标: ({x}, {y})，窗口: {title}")
+        self._append_log(f"🎯 已捕获目标 — 窗口：{title}，坐标：({x}, {y})")
 
-    def collect_config(self):
+    # ── 提示词卡片 ──────────────────────────────────────────
+
+    def add_prompt_card(self, text=''):
+        idx = len(self.prompt_cards) + 1
+
+        edit = QPlainTextEdit()
+        edit.setMinimumHeight(50)
+        edit.setPlaceholderText(f"第 {idx} 条内容（可多行，整块作为一条发送）")
+        if text:
+            edit.setPlainText(text)
+        edit.textChanged.connect(self._update_prompt_count)
+
+        btn_del = QPushButton("✕")
+        btn_del.setProperty("class", "btn-icon-del")
+        btn_del.setFixedSize(24, 24)
+        btn_del.setToolTip("删除该条")
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del.clicked.connect(lambda: self._remove_prompt_card(edit))
+
+        # 编号
+        num_lbl = QLabel(f"<b style='color:#00d4ff;'>{idx}</b>")
+        num_lbl.setFixedWidth(22)
+        num_lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        num_lbl.setStyleSheet("padding-top: 6px;")
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(num_lbl)
+        row.addWidget(edit, 1)
+        row.addWidget(btn_del, 0, Qt.AlignmentFlag.AlignTop)
+
+        card = QFrame()
+        card.setLayout(row)
+        card.setStyleSheet("QFrame { background: #0e1c33; border: 1px solid #1f3560; border-radius: 6px; }")
+        self.prompt_cards.append(edit)
+        self.prompt_list_layout.insertWidget(self.prompt_list_layout.count() - 1, card)
+        self.prompt_scroll.verticalScrollBar().setValue(self.prompt_scroll.verticalScrollBar().maximum())
+        self._update_prompt_count()
+        self._renumber_prompts()
+        return edit
+
+    def _remove_prompt_card(self, edit):
+        if edit not in self.prompt_cards:
+            return
+        self.prompt_cards.remove(edit)
+        card = edit.parentWidget()
+        self.prompt_list_layout.removeWidget(card)
+        card.deleteLater()
+        self._update_prompt_count()
+        self._renumber_prompts()
+
+    def _renumber_prompts(self):
+        """删除后重新编号"""
+        for i, edit in enumerate(self.prompt_cards, 1):
+            card = edit.parentWidget()
+            num_lbl = card.findChild(QLabel)
+            if num_lbl:
+                num_lbl.setText(f"<b style='color:#00d4ff;'>{i}</b>")
+            edit.setPlaceholderText(f"第 {i} 条内容（可多行，整块作为一条发送）")
+
+    def get_prompt_list(self):
+        return [edit.toPlainText().strip() for edit in self.prompt_cards if edit.toPlainText().strip()]
+
+    def _update_prompt_count(self):
+        n = len(self.get_prompt_list())
+        self.lbl_prompt_count.setText(f"共 {n} 条" if n else "共 0 条")
+
+    # ── 时间 / 预览 ──────────────────────────────────────────
+
+    @staticmethod
+    def _combine_dt(dt_edit):
+        return dt_edit.dateTime().toPython()
+
+    def _on_tick(self):
+        """每秒执行一次：刷新当前时间 + 倒计时"""
+        now = datetime.datetime.now()
+        self.lbl_now.setText(now.strftime("%Y-%m-%d  %H:%M:%S"))
+
+        # 倒计时
+        nxt = self.next_fire_time
+        if nxt is not None:
+            delta = nxt - now
+            total_secs = int(delta.total_seconds())
+            if total_secs <= 0:
+                self.lbl_countdown.setText("00:00:00")
+                self.lbl_countdown_label.setText("即将触发...")
+            else:
+                h = total_secs // 3600
+                m = (total_secs % 3600) // 60
+                s = total_secs % 60
+                self.lbl_countdown.setText(f"{h:02d}:{m:02d}:{s:02d}")
+                self.lbl_countdown_label.setText(f"下次触发：{nxt.strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            if self.worker and self.worker.isRunning():
+                # 运行中但没有下次触发 = 正在执行最后一次
+                pass
+            else:
+                self.lbl_countdown.setText("--:--:--")
+                self.lbl_countdown_label.setText("待命中 · 配置好后点启动")
+
+        # 非运行时每秒刷新预览（让"已过去"的提示实时更新）
+        if not (self.worker and self.worker.isRunning()):
+            self._refresh_schedule_preview()
+
+    def _refresh_schedule_preview(self):
+        self.list_schedule.clear()
+        mode = "single" if self.btn_seg_single.property("active") else "loop"
+
+        if mode == "single":
+            fire_dt = self._combine_dt(self.single_dt)
+            now = datetime.datetime.now()
+            if fire_dt <= now:
+                item = QListWidgetItem(f"⚠️  {fire_dt.strftime('%Y-%m-%d %H:%M:%S')}  （时间已过去，启动时会询问是否顺延）")
+                item.setForeground(QColor("#ffaa3d"))
+                self.list_schedule.addItem(item)
+            else:
+                item = QListWidgetItem(f"🕐  {fire_dt.strftime('%Y-%m-%d %H:%M:%S')}    单次 · 仅 1 次")
+                item.setForeground(QColor("#00d4ff"))
+                self.list_schedule.addItem(item)
+            return
+
+        # 循环
+        start_dt = self._combine_dt(self.loop_start_dt)
+        end_dt = self._combine_dt(self.loop_end_dt)
+        interval_min = self.spin_interval.value()
+        immediate = self.chk_immediate.isChecked()
+
+        fires = compute_fire_list("loop", start_dt, end_dt, interval_min, immediate, max_count=12)
+
+        if start_dt >= end_dt:
+            item = QListWidgetItem("⚠️  开始时间必须早于结束时间")
+            item.setForeground(QColor("#ff8aa3"))
+            self.list_schedule.addItem(item)
+            return
+
+        if not fires:
+            item = QListWidgetItem("⚠️  在结束时间之前已无触发机会")
+            item.setForeground(QColor("#ff8aa3"))
+            self.list_schedule.addItem(item)
+            return
+
+        for i, t in enumerate(fires):
+            tag = "第 1 次" if i == 0 else f"第 {i+1} 次"
+            item = QListWidgetItem(f"🕐  {t.strftime('%Y-%m-%d %H:%M:%S')}    {tag}")
+            if i == 0:
+                item.setForeground(QColor("#3dffa8"))
+            self.list_schedule.addItem(item)
+
+        # 判断是否还有更多
+        last = fires[-1]
+        nxt = last + datetime.timedelta(minutes=interval_min)
+        if nxt <= end_dt:
+            item = QListWidgetItem(f"  ……  还有更多次，直至 {end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            item.setForeground(QColor("#5a7ab0"))
+            self.list_schedule.addItem(item)
+
+    # ── 配置收集 ─────────────────────────────────────────────
+
+    def _collect_config(self, for_test=False):
         hwnd = self.win_combo.currentData()
         if not hwnd or not win32gui.IsWindow(hwnd):
-            QMessageBox.warning(self, "警告", "请先选择一个有效的目标窗口！")
+            QMessageBox.warning(self, "配置错误", "请先选择一个有效的目标窗口！")
             return None
 
-        prompt = self.txt_prompt.toPlainText()
-        if not prompt.strip():
-            QMessageBox.warning(self, "警告", "提示词内容不能为空！")
+        prompts = self.get_prompt_list()
+        if not prompts:
+            QMessageBox.warning(self, "配置错误", "请至少添加一条非空的发送内容！")
             return None
 
-        start_d = self.date_start.date().toPython()
-        end_d = self.date_end.date().toPython()
-        if start_d > end_d:
-            QMessageBox.warning(self, "警告", "开始日期不能晚于截止日期！")
-            return None
+        is_single = self.btn_seg_single.property("active")
+        now = datetime.datetime.now()
 
-        qtime = self.time_picker.time()
-        py_time = datetime.time(qtime.hour(), qtime.minute(), qtime.second())
-
-        if self.rb_single.isChecked():
-            now = datetime.datetime.now()
-            target_dt = datetime.datetime.combine(start_d, py_time)
-            if target_dt <= now and start_d == now.date():
+        if is_single:
+            start_dt = self._combine_dt(self.single_dt)
+            end_dt = start_dt
+            if not for_test and start_dt <= now:
                 reply = QMessageBox.question(
-                    self, "时间提示", 
-                    "所设单次时间已过去，是否自动顺延至明天？",
+                    self, "时间已过去",
+                    f"所设单次时间 {start_dt.strftime('%Y-%m-%d %H:%M:%S')} 已过去。\n是否自动顺延至明天同一时间？",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                 )
                 if reply == QMessageBox.StandardButton.Yes:
-                    self.date_start.setDate(QDate.currentDate().addDays(1))
-                    start_d = self.date_start.date().toPython()
+                    start_dt = start_dt + datetime.timedelta(days=1)
+                    end_dt = start_dt
+                    self.single_dt.setDateTime(QDateTime(start_dt.year, start_dt.month, start_dt.day,
+                                                         start_dt.hour, start_dt.minute, start_dt.second))
                 else:
                     return None
+        else:
+            start_dt = self._combine_dt(self.loop_start_dt)
+            end_dt = self._combine_dt(self.loop_end_dt)
+            if start_dt >= end_dt:
+                QMessageBox.warning(self, "配置错误", "开始时间必须早于结束时间！")
+                return None
 
         return {
             'hwnd': hwnd,
-            'prompt': prompt,
+            'prompts': prompts,
+            'strategy': 'random' if self.combo_strategy.currentIndex() == 1 else 'sequence',
             'click_pos': (self.spin_x.value(), self.spin_y.value()),
-            'mode': 'single' if self.rb_single.isChecked() else 'loop',
-            'trigger_time': py_time,
+            'mode': 'single' if is_single else 'loop',
+            'start_dt': start_dt,
+            'end_dt': end_dt,
             'interval_min': self.spin_interval.value(),
             'run_immediately': self.chk_immediate.isChecked(),
-            'start_date': start_d,
-            'end_date': end_d
         }
+
+    # ── 任务控制 ─────────────────────────────────────────────
 
     def toggle_task(self):
         if self.worker and self.worker.isRunning():
+            # 停止
             self.worker.requestInterruption()
             while not self.worker.wait(100):
                 QApplication.processEvents()
             self.worker = None
-            self.btn_toggle.setText("▶ 启动定时监听")
-            self.btn_toggle.setStyleSheet("")
-            self.status_bar.showMessage("任务已安全停止。")
+            self.next_fire_time = None
+            self.btn_toggle.setText("▶  启动定时")
+            self.btn_toggle.setProperty("class", "btn-primary")
+            self.btn_toggle.style().unpolish(self.btn_toggle)
+            self.btn_toggle.style().polish(self.btn_toggle)
+            self._set_status("idle", "● 已停止")
+            self._append_log("⏹️  任务已停止。")
             return
 
-        cfg = self.collect_config()
+        cfg = self._collect_config()
         if not cfg:
             return
 
         self.worker = SchedulerWorker(cfg)
-        self.worker.log_signal.connect(self.status_bar.showMessage)
-        self.worker.task_done_signal.connect(self.on_task_finished)
+        self.worker.log_signal.connect(self._append_log)
+        self.worker.status_signal.connect(self._on_worker_status)
+        self.worker.next_fire_signal.connect(self._on_next_fire)
         self.worker.start()
 
-        self.btn_toggle.setText("■ 停止监听")
-        self.btn_toggle.setStyleSheet("background-color: #d9534f; color: white;")
+        self.btn_toggle.setText("■  停止定时")
+        self.btn_toggle.setProperty("class", "btn-danger")
+        self.btn_toggle.style().unpolish(self.btn_toggle)
+        self.btn_toggle.style().polish(self.btn_toggle)
+        self._set_status("running", "● 运行中")
 
-    def on_task_finished(self):
-        self.btn_toggle.setText("▶ 启动定时监听")
-        self.btn_toggle.setStyleSheet("")
+    def _on_worker_status(self, status):
+        if status == "running":
+            self._set_status("running", "● 运行中")
+        elif status == "done":
+            self._set_status("done", "● 已完成")
+            self.btn_toggle.setText("▶  启动定时")
+            self.btn_toggle.setProperty("class", "btn-primary")
+            self.btn_toggle.style().unpolish(self.btn_toggle)
+            self.btn_toggle.style().polish(self.btn_toggle)
+            self.next_fire_time = None
+            self.worker = None
+
+    def _on_next_fire(self, nxt):
+        self.next_fire_time = nxt
+
+    def _set_status(self, state, text):
+        self.status_pill.setText(text)
+        self.status_pill.setProperty("state", state)
+        self.status_pill.style().unpolish(self.status_pill)
+        self.status_pill.style().polish(self.status_pill)
+
+    # ── 测试 ────────────────────────────────────────────────
 
     def test_trigger(self):
-        cfg = self.collect_config()
+        cfg = self._collect_config(for_test=True)
         if not cfg:
             return
-        self.status_bar.showMessage("正在执行测试...")
-        ok = click_and_paste_send(cfg['hwnd'], cfg['prompt'], cfg['click_pos'])
+        self._append_log("⚡  执行测试发送...")
+        prompts = cfg['prompts']
+        prompt = random.choice(prompts) if cfg['strategy'] == 'random' else prompts[0]
+        ok = click_and_paste_send(cfg['hwnd'], prompt, cfg['click_pos'])
         if ok:
-            self.status_bar.showMessage("测试完成：已聚焦并发送。")
+            self._append_log("✅  测试完成：已聚焦并发送。")
         else:
-            self.status_bar.showMessage("测试失败：请确认目标窗口权限是否高于本程序。")
+            self._append_log("❌  测试失败：请确认目标窗口权限是否高于本程序。")
+
+    # ── 日志 ────────────────────────────────────────────────
+
+    def _append_log(self, msg):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.log_view.append(f"[{ts}]  {msg}")
+        # 自动滚到底
+        sb = self.log_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    # ── 关闭 ────────────────────────────────────────────────
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
@@ -499,10 +1402,14 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+# ═══════════════════════════════════════════════════════════════
+#  入口
+# ═══════════════════════════════════════════════════════════════
+
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    font = QFont("Microsoft YaHei", 9)
+    font = QFont("Microsoft YaHei UI", 9)
     app.setFont(font)
     win = MainWindow()
     win.show()

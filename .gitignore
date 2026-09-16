@@ -5,3 +5,12 @@ __pycache__/
 dist/
 build/
 *.spec
+
+# 构建产物
+*.zip
+*.exe
+
+# 工具缓存目录
+.codegraph/
+.omo/
+.opencode/
