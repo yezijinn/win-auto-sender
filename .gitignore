@@ -10,7 +10,16 @@ build/
 *.zip
 *.exe
 
+# 运行时配置（自动生成，含用户设置与发送内容，不应入库）
+*.ini
+
 # 工具缓存目录
 .codegraph/
 .omo/
 .opencode/
+
+# 会话调试脚本与截图
+_hot.py
+_shot.py
+_smoke.py
+_layout.png

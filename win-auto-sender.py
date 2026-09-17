@@ -4,11 +4,14 @@
 向指定窗口定时粘贴并发送内容，支持单次/循环、多提示词轮转
 """
 import sys
+import os
+import re
 import time
 import datetime
 import random
 import ctypes
 from ctypes import wintypes
+import configparser
 import pyperclip
 import win32gui
 import win32process
@@ -29,9 +32,9 @@ from PySide6.QtWidgets import (
     QLabel, QComboBox, QPushButton, QSpinBox, QMessageBox,
     QListWidget, QListWidgetItem, QScrollArea, QPlainTextEdit,
     QDateTimeEdit, QCheckBox, QFrame, QSizePolicy,
-    QTextEdit, QButtonGroup
+    QTextEdit, QButtonGroup, QFileDialog, QLineEdit
 )
-from PySide6.QtCore import Qt, QTime, QDate, QDateTime, QThread, Signal, QTimer, QSize
+from PySide6.QtCore import Qt, QTime, QDate, QDateTime, QThread, Signal, QTimer, QSize, QFileSystemWatcher
 from PySide6.QtGui import QFont, QCursor, QPainter, QPen, QColor, QKeyEvent, QIcon, QPixmap, QBrush
 
 user32 = ctypes.windll.user32
@@ -41,6 +44,145 @@ kernel32 = ctypes.windll.kernel32
 # ═══════════════════════════════════════════════════════════════
 #  工具函数
 # ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+#  配置文件管理（config-win-auto-sender.ini，与脚本同级目录）
+# ═══════════════════════════════════════════════════════════════
+
+PROMPT_SEP_RE = re.compile(r'^\s*-{3,}\s*$')   # --- 分割行
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "config-win-auto-sender.ini")
+DEFAULT_CONFIG_FILE = None if False else CONFIG_FILE
+
+
+def default_config_file():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "config-win-auto-sender.ini")
+
+
+def split_prompt_text(text):
+    """把多提示词文本按 --- 分割成若干条（约等于 | 拼接，兼容各种换行）。
+    - 以 '---' 行为分隔符
+    - 允许每段内部多行
+    - 开头/结尾的无分隔符内容也识别为一条
+    返回非空字符串列表。
+    """
+    if not text:
+        return []
+    lines = text.split('\n')
+    blocks = []
+    cur = []
+    for ln in lines:
+        if PROMPT_SEP_RE.match(ln):
+            blocks.append(cur)
+            cur = []
+        else:
+            cur.append(ln)
+    blocks.append(cur)
+    # 合并：去掉纯空块，strip 每块首尾空白
+    result = []
+    for b in blocks:
+        joined = "\n".join(b).strip()
+        if joined:
+            result.append(joined)
+    return result
+
+
+def load_config_file(path=None):
+    """从 ini 读取配置，返回 dict。文件不存在或无内容则返回默认。"""
+    path = path or default_config_file()
+    cfg = {
+        'mode': 'single',
+        'strategy': 'sequence',
+        'interval_min': 10,
+        'run_immediately': False,
+        'click_x': 0,
+        'click_y': 0,
+        'window_title': '',
+        'single_dt': None,          # 保留原始字符串，按需再解析
+        'loop_start_dt': None,
+        'loop_end_dt': None,
+        'prompts': [],
+    }
+    if not os.path.exists(path):
+        return cfg
+    try:
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read(path, encoding='utf-8')
+    except Exception:
+        return cfg
+
+    if parser.has_section('general'):
+        g = parser['general']
+        if g.get('mode', '').replace('"', '').strip() in ('single', 'loop'):
+            cfg['mode'] = g.get('mode').strip().strip('"')
+        if g.get('strategy', '').replace('"', '') in ('sequence', 'random'):
+            cfg['strategy'] = g.get('strategy').strip().strip('"')
+        for key in ('interval_min', 'click_x', 'click_y'):
+            if key in g:
+                try:
+                    cfg[key] = int(float(g[key].strip().strip('"')))
+                except Exception:
+                    pass
+        if 'run_immediately' in g:
+            val = g['run_immediately'].strip().strip('"').lower()
+            cfg['run_immediately'] = val in ('true', '1', 'yes', 'on')
+        for key in ('window_title',):
+            if key in g and g[key].strip():
+                cfg[key] = g[key].strip().strip('"')
+
+        # 日期时间字段：解析字符串 → datetime
+        for key in ('single_dt', 'loop_start_dt', 'loop_end_dt'):
+            if key in g and g[key].strip():
+                try:
+                    cfg[key] = datetime.datetime.strptime(
+                        g[key].strip().strip('"'), '%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    cfg[key] = g[key].strip().strip('"')
+
+    # 发送内容（支持多段文本，用 --- 分隔）
+    if parser.has_option('prompts', 'content'):
+        raw = parser['prompts']['content']
+        cfg['prompts'] = split_prompt_text(raw)
+    return cfg
+
+
+def save_config_file(cfg, path=None):
+    """把配置写入 ini。路径使用 CONFIG_FILE（脚本同级）。"""
+    path = path or default_config_file()
+    try:
+        parser = configparser.ConfigParser(interpolation=None)
+        if os.path.exists(path):
+            try:
+                parser.read(path, encoding='utf-8')
+            except Exception:
+                parser = configparser.ConfigParser(interpolation=None)
+
+        if not parser.has_section('general'):
+            parser.add_section('general')
+        gen = cfg['general'] if isinstance(cfg, dict) and 'general' in cfg else cfg
+        parser['general']['mode'] = str(gen.get('mode', 'single'))
+        parser['general']['strategy'] = str(gen.get('strategy', 'sequence'))
+        parser['general']['interval_min'] = str(gen.get('interval_min', 10))
+        parser['general']['run_immediately'] = str(bool(gen.get('run_immediately', False))).lower()
+        parser['general']['click_x'] = str(gen.get('click_x', 0))
+        parser['general']['click_y'] = str(gen.get('click_y', 0))
+        parser['general']['window_title'] = str(gen.get('window_title', ''))
+        for dt_key in ('single_dt', 'loop_start_dt', 'loop_end_dt'):
+            val = gen.get(dt_key, '')
+            parser['general'][dt_key] = val.strftime('%Y-%m-%d %H:%M:%S') if hasattr(val, 'strftime') else str(val if val else '')
+
+        # 发送内容：多个提示词用 === 分隔写入至 [prompts] 的 content
+        prompts = gen.get('prompts') if 'prompts' in gen else cfg.get('prompts', [])
+        if not parser.has_section('prompts'):
+            parser.add_section('prompts')
+        parser.set('prompts', 'content', '\n---\n'.join(prompts))
+
+        with open(path, 'w', encoding='utf-8') as f:
+            parser.write(f)
+    except Exception:
+        pass
+
 
 def is_admin():
     try:
@@ -470,7 +612,7 @@ QLabel[class="status-pill"][state="done"] {
 
 /* ===== 倒计时 ===== */
 QLabel[class="countdown"] {
-    font-size: 22pt;
+    font-size: 18pt;
     font-weight: 700;
     color: #00d4ff;
     font-family: "Consolas", "Courier New", monospace;
@@ -672,19 +814,38 @@ class MainWindow(QMainWindow):
         if is_admin():
             title += "  ·  管理员模式"
         self.setWindowTitle(title)
-        self.setMinimumSize(900, 560)
-        self.resize(1040, 720)
+        # 固定窗口：无拖动条，12:9 固定尺寸
+        self.setFixedSize(1200, 900)
 
         self.worker = None
         self.prompt_cards = []
         self.next_fire_time = None  # 用于倒计时显示
+        self._config_file = default_config_file()
+        self._loading = True     # 初始化期间抑制自动保存
+        self._initializing = True  # 覆盖整个构造期（_set_mode 会再触发保存）
+        self._pending_save = False
+        self._watcher = QFileSystemWatcher(self)
+        if os.path.exists(self._config_file):
+            self._watcher.addPath(self._config_file)
+        self._watcher.fileChanged.connect(self._on_config_watcher)
 
         self._setup_style()
         self._init_ui()
         self._refresh_window_list()
-        self.add_prompt_card()
+
+        # 加载配置：若 ini 不存在则创建默认配置
+        initial = load_config_file(self._config_file)
+        if not os.path.exists(self._config_file):
+            self._persist()
+        self._apply_config(initial)
+
         self._on_mode_changed()
         self._refresh_schedule_preview()
+        self._loading = False
+        self._initializing = False
+        self._pending_save = False
+        if hasattr(self, '_debounce_timer'):
+            self._debounce_timer.stop()
 
         # 每秒刷新：当前时间 + 倒计时 +（非运行时）预览
         self._timer = QTimer(self)
@@ -705,26 +866,32 @@ class MainWindow(QMainWindow):
         card = QFrame()
         card.setProperty("class", "card")
         outer = QVBoxLayout(card)
-        outer.setContentsMargins(16, 14, 16, 14)
-        outer.setSpacing(12)
+        has_title = bool(title_text)
+        # 无标题时减小上下留白，把空间留给卡片内容
+        outer.setContentsMargins(16, 14 if has_title else 8, 16, 10)
+        outer.setSpacing(12 if has_title else 4)
 
-        # 标题栏
-        title_bar = QHBoxLayout()
-        title_bar.setSpacing(8)
-        if icon_text:
-            icon_lbl = QLabel(icon_text)
-            icon_lbl.setProperty("class", "card-icon")
-            title_bar.addWidget(icon_lbl)
-        title_lbl = QLabel(title_text)
-        title_lbl.setProperty("class", "card-title")
-        title_bar.addWidget(title_lbl)
-        title_bar.addStretch()
-        outer.addLayout(title_bar)
+        # 标题栏（title_text 为空则不生成，卡片顶部直接是第一行正文）
+        if has_title:
+            title_bar = QHBoxLayout()
+            title_bar.setSpacing(8)
+            if icon_text:
+                icon_lbl = QLabel(icon_text)
+                icon_lbl.setProperty("class", "card-icon")
+                title_bar.addWidget(icon_lbl)
+            title_lbl = QLabel(title_text)
+            title_lbl.setProperty("class", "card-title")
+            title_bar.addWidget(title_lbl)
+            title_bar.addStretch()
+            outer.addLayout(title_bar)
+            tb = title_bar
+        else:
+            tb = None
 
         content = QVBoxLayout()
         content.setSpacing(8)
         outer.addLayout(content)
-        return card, content, title_bar
+        return card, content, tb
 
     # ── UI 构建 ─────────────────────────────────────────────
 
@@ -755,58 +922,46 @@ class MainWindow(QMainWindow):
 
         root.addLayout(header)
 
-        # ─── 主体内容放入滚动区，避免任何控件被挤压重叠 ───
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # ─── 主体：左右两列（固定窗口，无窗口级滚动条） ───
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 2, 0, 4)
+        body.setSpacing(12)
 
-        scroll_body = QWidget()
-        scroll_layout = QHBoxLayout(scroll_body)
-        scroll_layout.setContentsMargins(0, 2, 6, 4)
-        scroll_layout.setSpacing(12)
-        scroll.setWidget(scroll_body)
-
-        # === 左列 ===
+        # === 左列：目标窗口15% / 发送计划55% / 距下次触发15% / 运行日志15% ===
         left = QVBoxLayout()
         left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(12)
+        left.setSpacing(10)
 
-        # 目标卡片
         target_card, target_layout, _ = self._card("目标窗口", "🎯")
         self._build_target_card(target_layout)
-        left.addWidget(target_card)
+        left.addWidget(target_card, 3)
 
-        # 内容卡片
-        content_card, content_layout, _ = self._card("发送内容", "📝")
-        self._build_content_card(content_layout)
-        left.addWidget(content_card)
+        sched_card, sched_layout, _ = self._card("")          # 发送计划（无大标题）
+        self._build_schedule_card(sched_layout)
+        left.addWidget(sched_card, 11)
 
-        scroll_layout.addLayout(left, 1)
+        cd_card, cd_layout, _ = self._card("")                # 距下次触发（无大标题）
+        self._build_countdown_card(cd_layout)
+        left.addWidget(cd_card, 3)
 
-        # === 右列 ===
+        log_card, log_layout, _ = self._card("")              # 运行日志（无大标题）
+        self._build_log_card(log_layout)
+        left.addWidget(log_card, 3)
+
+        body.addLayout(left, 11)
+
+        # === 右列：发送内容占满整列高度 ===
         right = QVBoxLayout()
         right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(12)
+        right.setSpacing(0)
 
-        # 计划卡片
-        sched_card, sched_layout, _ = self._card("发送计划", "⏰")
-        self._build_schedule_card(sched_layout)
-        right.addWidget(sched_card)
+        content_card, content_layout, _ = self._card("发送内容", "📝")
+        self._build_content_card(content_layout)
+        right.addWidget(content_card, 12)
 
-        # 倒计时卡片
-        cd_card, cd_layout, _ = self._card("距下次触发", "⏳")
-        self._build_countdown_card(cd_layout)
-        right.addWidget(cd_card)
+        body.addLayout(right, 12)
 
-        # 日志卡片
-        log_card, log_layout, _ = self._card("运行日志", "📋")
-        self._build_log_card(log_layout)
-        right.addWidget(log_card)
-
-        scroll_layout.addLayout(right, 1)
-
-        root.addWidget(scroll, 1)
+        root.addLayout(body, 1)
 
         # ─── 底部操作栏（固定在窗口底部，不进滚动区） ───
         bar = QHBoxLayout()
@@ -859,6 +1014,7 @@ class MainWindow(QMainWindow):
         combo_row.addWidget(self.win_combo, 1)
         combo_row.addWidget(btn_win_refresh)
         right_col.addLayout(combo_row)
+        self.win_combo.currentIndexChanged.connect(self._on_ui_changed_for_save)
 
         # 坐标
         coord_row = QHBoxLayout()
@@ -872,6 +1028,8 @@ class MainWindow(QMainWindow):
         btn_clear_coord.setProperty("class", "btn-secondary")
         btn_clear_coord.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_clear_coord.clicked.connect(lambda: (self.spin_x.setValue(0), self.spin_y.setValue(0)))
+        self.spin_x.valueChanged.connect(self._on_ui_changed_for_save)
+        self.spin_y.valueChanged.connect(self._on_ui_changed_for_save)
         coord_row.addWidget(self.spin_x)
         coord_row.addWidget(self.spin_y)
         coord_row.addWidget(btn_clear_coord)
@@ -880,11 +1038,6 @@ class MainWindow(QMainWindow):
 
         row1.addLayout(right_col, 1)
         layout.addLayout(row1)
-
-        hint = QLabel("💡 按住左侧准星拖到目标窗口的输入框上松开，可自动绑定窗口并记录点击坐标。")
-        hint.setStyleSheet("color: #7a93c0; font-size: 8.5pt;")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
 
     def _build_content_card(self, layout):
         # 滚动区
@@ -910,11 +1063,19 @@ class MainWindow(QMainWindow):
         btn_add.clicked.connect(lambda: self.add_prompt_card())
         bottom.addWidget(btn_add)
 
+        btn_import = QPushButton("📂 导入文件")
+        btn_import.setProperty("class", "btn-ghost")
+        btn_import.setToolTip("导入 .txt / .md，用 --- 分隔多条发送内容")
+        btn_import.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_import.clicked.connect(self._import_send_file)
+        bottom.addWidget(btn_import)
+
         bottom.addSpacing(10)
         bottom.addWidget(QLabel("策略:"))
         self.combo_strategy = QComboBox()
         self.combo_strategy.addItem("顺序循环")
         self.combo_strategy.addItem("随机发送")
+        self.combo_strategy.currentIndexChanged.connect(self._on_ui_changed_for_save)
         bottom.addWidget(self.combo_strategy)
 
         bottom.addStretch()
@@ -981,26 +1142,24 @@ class MainWindow(QMainWindow):
         self.loop_panel = QWidget()
         lp = QVBoxLayout(self.loop_panel)
         lp.setContentsMargins(2, 6, 2, 4)
-        lp.setSpacing(10)
+        lp.setSpacing(2)   # 三行紧凑，行间距接近 0，把高度让给下方预览列表
 
         # 开始
-        label2 = QLabel("开始时间")
-        label2.setStyleSheet("color: #7a93c0; font-size: 9pt; font-weight: 500;")
-        lp.addWidget(label2)
         self.loop_start_dt = QDateTimeEdit(QDateTime.currentDateTime().addSecs(60))
         self.loop_start_dt.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
         self.loop_start_dt.setCalendarPopup(True)
-        self.loop_start_dt.setMinimumHeight(30)
+        self.loop_start_dt.setMinimumHeight(48)
+        self.loop_start_dt.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.loop_start_dt.setStyleSheet("QDateTimeEdit { font-size: 12pt; font-weight: 600; }")
         lp.addWidget(self.loop_start_dt)
 
         # 结束
-        label3 = QLabel("结束时间")
-        label3.setStyleSheet("color: #7a93c0; font-size: 9pt; font-weight: 500;")
-        lp.addWidget(label3)
         self.loop_end_dt = QDateTimeEdit(QDateTime.currentDateTime().addDays(7))
         self.loop_end_dt.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
         self.loop_end_dt.setCalendarPopup(True)
-        self.loop_end_dt.setMinimumHeight(30)
+        self.loop_end_dt.setMinimumHeight(48)
+        self.loop_end_dt.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.loop_end_dt.setStyleSheet("QDateTimeEdit { font-size: 12pt; font-weight: 600; }")
         lp.addWidget(self.loop_end_dt)
 
         # 间隔 + 立即
@@ -1011,7 +1170,9 @@ class MainWindow(QMainWindow):
         self.spin_interval.setRange(1, 1440)
         self.spin_interval.setValue(10)
         self.spin_interval.setSuffix(" 分钟")
-        self.spin_interval.setMinimumHeight(30)
+        self.spin_interval.setMinimumHeight(48)
+        self.spin_interval.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.spin_interval.setStyleSheet("QSpinBox { font-size: 12pt; font-weight: 600; }")
         opt_row.addWidget(self.spin_interval)
         opt_row.addSpacing(12)
         self.chk_immediate = QCheckBox("启动时立即发第 1 次")
@@ -1033,16 +1194,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(pv_title)
 
         self.list_schedule = QListWidget()
-        self.list_schedule.setMinimumHeight(110)
+        # 预览列表吸收循环设置三行紧凑后让出的垂直空间
+        self.list_schedule.setMinimumHeight(90)
         self.list_schedule.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        layout.addWidget(self.list_schedule)
+        layout.addWidget(self.list_schedule, 1)
 
-        # 连接所有变化信号
+        # 连接所有变化信号（预览刷新 + 自动保存）
         self.single_dt.dateTimeChanged.connect(self._refresh_schedule_preview)
+        self.single_dt.dateTimeChanged.connect(self._on_ui_changed_for_save)
         self.loop_start_dt.dateTimeChanged.connect(self._refresh_schedule_preview)
+        self.loop_start_dt.dateTimeChanged.connect(self._on_ui_changed_for_save)
         self.loop_end_dt.dateTimeChanged.connect(self._refresh_schedule_preview)
+        self.loop_end_dt.dateTimeChanged.connect(self._on_ui_changed_for_save)
         self.spin_interval.valueChanged.connect(self._refresh_schedule_preview)
+        self.spin_interval.valueChanged.connect(self._on_ui_changed_for_save)
         self.chk_immediate.toggled.connect(self._refresh_schedule_preview)
+        self.chk_immediate.toggled.connect(self._on_ui_changed_for_save)
 
     def _build_countdown_card(self, layout):
         self.lbl_countdown = QLabel("--:--:--")
@@ -1059,7 +1226,8 @@ class MainWindow(QMainWindow):
         self.log_view = QTextEdit()
         self.log_view.setProperty("class", "log-view")
         self.log_view.setReadOnly(True)
-        self.log_view.setMinimumHeight(120)
+        self.log_view.setMinimumHeight(56)   # 日志卡片约占左列15%，保持紧凑
+        self.log_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self.log_view)
 
     # ── 模式切换 ─────────────────────────────────────────────
@@ -1076,10 +1244,169 @@ class MainWindow(QMainWindow):
         self.single_panel.setVisible(is_single)
         self.loop_panel.setVisible(not is_single)
         self._refresh_schedule_preview()
+        self._on_ui_changed_for_save()
 
     def _on_mode_changed(self):
         # 初始化时根据默认选中状态设置面板可见性
         self._set_mode("single")
+
+    # ── 配置文件：持久化 + 热更新 ─────────────────────────────
+
+    def _on_ui_changed_for_save(self, *_):
+        """任何 UI 改动 → 立即持久化（含热更新的本地回写）。"""
+        if self._is_loading():
+            return
+        self._pending_save = True
+        if not hasattr(self, '_debounce_timer'):
+            self._debounce_timer = QTimer(self)
+            self._debounce_timer.setSingleShot(True)
+            self._debounce_timer.timeout.connect(self._flush_pending_save)
+        self._debounce_timer.start(400)
+
+    def _set_loading_flag(self, on):
+        self._loading = on
+
+    def _is_loading(self):
+        return bool(getattr(self, '_loading', False)) or bool(getattr(self, '_initializing', False))
+
+    def _flush_pending_save(self):
+        self._pending_save = False
+        if self._is_loading():
+            return
+        self._persist()
+
+    def _collect_persist_dict(self):
+        """从当前 UI 收集配置状态（供写盘）。"""
+        is_single = self.btn_seg_single.property("active")
+        return {
+            'mode': 'single' if is_single else 'loop',
+            'strategy': 'random' if self.combo_strategy.currentIndex() == 1 else 'sequence',
+            'interval_min': self.spin_interval.value(),
+            'run_immediately': self.chk_immediate.isChecked(),
+            'click_x': self.spin_x.value(),
+            'click_y': self.spin_y.value(),
+            'window_title': self.win_combo.currentText(),
+            'single_dt': self._combine_dt(self.single_dt),
+            'loop_start_dt': self._combine_dt(self.loop_start_dt),
+            'loop_end_dt': self._combine_dt(self.loop_end_dt),
+            'prompts': self.get_prompt_list(),
+        }
+
+    def _persist(self):
+        """把当前 UI 状态写入 ini。写盘前先临时摘除 watcher 防止热更新自触发。"""
+        try:
+            if self._watcher:
+                self._watcher.removePath(self._config_file)
+        except Exception:
+            pass
+        try:
+            save_config_file({'general': self._collect_persist_dict()}, self._config_file)
+        finally:
+            try:
+                if os.path.exists(self._config_file):
+                    self._watcher.addPath(self._config_file)
+            except Exception:
+                pass
+
+    def _apply_config(self, cfg):
+        """把加载到的配置应用到 UI（热更新入口也用）。"""
+        self._set_loading_flag(True)
+
+        if cfg.get('mode') == 'loop':
+            self._set_mode("loop")
+        else:
+            self._set_mode("single")
+
+        if cfg.get('strategy') == 'random':
+            self.combo_strategy.setCurrentIndex(1)
+        else:
+            self.combo_strategy.setCurrentIndex(0)
+
+        self.spin_interval.setValue(int(cfg.get('interval_min', 10)))
+        self.chk_immediate.setChecked(bool(cfg.get('run_immediately', False)))
+        self.spin_x.setValue(int(cfg.get('click_x', 0)))
+        self.spin_y.setValue(int(cfg.get('click_y', 0)))
+
+        # 匹配目标窗口标题
+        wt = cfg.get('window_title', '')
+        if wt:
+            idx = self.win_combo.findText(wt)
+            if idx >= 0:
+                self.win_combo.setCurrentIndex(idx)
+
+        # 时间
+        for widget, dt_val in (
+            (self.single_dt, cfg.get('single_dt')),
+            (self.loop_start_dt, cfg.get('loop_start_dt')),
+            (self.loop_end_dt, cfg.get('loop_end_dt')),
+        ):
+            if dt_val and hasattr(dt_val, 'strftime'):
+                widget.setDateTime(QDateTime(dt_val.year, dt_val.month, dt_val.day,
+                                             dt_val.hour, dt_val.minute, dt_val.second))
+
+        # 发送内容
+        prompts = cfg.get('prompts', [])
+        if not prompts:
+            prompts = [""]
+        self._set_prompts(prompts)
+
+        self._set_loading_flag(False)
+        self._refresh_schedule_preview()
+
+    def _on_config_watcher(self, path):
+        """配置文件被外部修改 → 防抖后重新加载并同步 UI。"""
+        if self._is_loading():
+            return
+        if self.worker and self.worker.isRunning():
+            self._append_log("⚠️  检测到配置文件改动，任务运行中，待停再同步 UI。")
+            return
+        # 防抖
+        if not hasattr(self, '_reload_timer'):
+            self._reload_timer = QTimer(self)
+            self._reload_timer.setSingleShot(True)
+            self._reload_timer.timeout.connect(self._reload_from_disk)
+        self._reload_timer.start(400)
+
+    def _reload_from_disk(self):
+        cfg = load_config_file(self._config_file)
+        self._apply_config(cfg)
+        self._append_log("🔄  配置热更新：已重新加载 config-win-auto-sender.ini")
+
+    def _set_prompts(self, prompts):
+        """用给定列表重建所有提示词卡片。"""
+        for edit in list(self.prompt_cards):
+            self._remove_prompt_card(edit)
+        for text in prompts:
+            if text:
+                self.add_prompt_card(text)
+        if not self.prompt_cards:
+            self.add_prompt_card()
+
+    # ── 导入发送内容文件 ──────────────────────────────────────
+
+    def _import_send_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入发送内容", "",
+            "文本 / Markdown (*.txt *.md);;所有文件 (*.*)")
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            try:
+                with open(path, 'r', encoding='gbk') as f:
+                    text = f.read()
+            except Exception as e:
+                QMessageBox.warning(self, "导入失败", f"无法读取文件：{e}")
+                return
+        prompts = split_prompt_text(text)
+        if not prompts:
+            QMessageBox.information(self, "导入", "文件中没有可识别的发送内容。")
+            return
+        self._set_prompts(prompts)
+        self._append_log(f"📂  已导入 {len(prompts)} 条发送内容（来自 {os.path.basename(path)}）")
+        self._persist()
 
     # ── 窗口列表 ─────────────────────────────────────────────
 
@@ -1111,11 +1438,15 @@ class MainWindow(QMainWindow):
         idx = len(self.prompt_cards) + 1
 
         edit = QPlainTextEdit()
-        edit.setMinimumHeight(50)
+        # 每条固定占 3 行高度，不随内容动态变高
+        line_h = edit.fontMetrics().lineSpacing()
+        edit.setFixedHeight(int(line_h * 3) + 12)
+        edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         edit.setPlaceholderText(f"第 {idx} 条内容（可多行，整块作为一条发送）")
         if text:
             edit.setPlainText(text)
         edit.textChanged.connect(self._update_prompt_count)
+        edit.textChanged.connect(self._on_ui_changed_for_save)
 
         btn_del = QPushButton("✕")
         btn_del.setProperty("class", "btn-icon-del")
