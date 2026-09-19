@@ -71,6 +71,16 @@ Or simply double-click `dist\WindowsLoopSend.exe` (single file; no Python needed
 
 ---
 
+## 📥 Import Prompts
+
+Import `发送内容.txt` / `发送内容.md` in one click — the app **auto-splits by `---`** into independent prompt cards (missing markers at the start/end are handled intelligently). You can also load a `.ini` config via the **📥 Import Config** button.
+
+<p align="center">
+  <img src="docs/导入文本列表.png" alt="Import prompt list" width="640"/>
+</p>
+
+---
+
 ## 🪟 Multi-Window / Multi-Target
 
 Click **“🆕 New Window (for another target)”** to open a fully independent instance — **separate process + separate config file** (`config-<name>-win-auto-sender.ini`). Prompts, preface/suffix, schedule and target are all independent per instance.
