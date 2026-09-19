@@ -4,7 +4,6 @@ __pycache__/
 .mypy_cache/
 dist/
 build/
-*.spec
 
 # 构建产物
 *.zip
@@ -23,3 +22,6 @@ _hot.py
 _shot.py
 _smoke.py
 _layout.png
+
+# 个人提示词数据文件（含发送内容，不应入库）
+KLBQ*.txt

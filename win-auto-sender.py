@@ -7,8 +7,10 @@ import sys
 import os
 import re
 import time
+import subprocess
 import datetime
 import random
+import uuid
 import ctypes
 from ctypes import wintypes
 import configparser
@@ -17,6 +19,7 @@ import win32gui
 import win32process
 import win32con
 import win32api
+import win32event
 
 # ── DPI 感知（必须在 QApplication 之前） ──────────────────────
 try:
@@ -50,42 +53,61 @@ kernel32 = ctypes.windll.kernel32
 # ═══════════════════════════════════════════════════════════════
 
 PROMPT_SEP_RE = re.compile(r'^\s*-{3,}\s*$')   # --- 分割行
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "config-win-auto-sender.ini")
-DEFAULT_CONFIG_FILE = None if False else CONFIG_FILE
+# 内部持久化分隔符：含不可见控制符，普通提示词几乎不可能出现，
+# 避免内容含 === 或 --- 行时保存后重读被错误拆分（往返损坏）
+PROMPT_SEP = '\n\x1F-WindowLoopSend-SEPARATOR-\x1F\n'
 
 
-def default_config_file():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "config-win-auto-sender.ini")
+def _script_dir():
+    """脚本或 exe 所在目录。exe 打包后 __file__ 指向临时解压目录，须改用 sys.executable。"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def default_config_file(instance=''):
+    """配置文件路径。传入 instance（实例名）时派生独立配置文件，实现多开数据/配置隔离。"""
+    name = "config-win-auto-sender.ini"
+    if instance:
+        name = "config-win-auto-sender-%s.ini" % instance
+    return os.path.join(_script_dir(), name)
 
 
 def split_prompt_text(text):
-    """把多提示词文本按 --- 分割成若干条（约等于 | 拼接，兼容各种换行）。
-    - 以 '---' 行为分隔符
-    - 允许每段内部多行
-    - 开头/结尾的无分隔符内容也识别为一条
+    """把多提示词文本分割成若干条（兼容各种换行）。
+    - 若含内部不可见分隔符（PROMPT_SEP，程序写入），按它精确分割，无往返损坏
+    - 否则按 '---' 行分割（用户导入 .txt/.md 友好），开头/结尾无分隔符也识别
     返回非空字符串列表。
     """
     if not text:
         return []
-    lines = text.split('\n')
-    blocks = []
-    cur = []
-    for ln in lines:
-        if PROMPT_SEP_RE.match(ln):
-            blocks.append(cur)
-            cur = []
-        else:
-            cur.append(ln)
-    blocks.append(cur)
+    if PROMPT_SEP in text:
+        blocks = text.split(PROMPT_SEP)
+    else:
+        lines = text.split('\n')
+        blocks = []
+        cur = []
+        for ln in lines:
+            if PROMPT_SEP_RE.match(ln):
+                blocks.append(cur)
+                cur = []
+            else:
+                cur.append(ln)
+        blocks.append(cur)
     # 合并：去掉纯空块，strip 每块首尾空白
     result = []
     for b in blocks:
-        joined = "\n".join(b).strip()
+        joined = ("\n".join(b) if isinstance(b, list) else b).strip()
         if joined:
             result.append(joined)
     return result
+
+
+def compose_send_text(preface, prompt):
+    """把「附加前言」合并到发送内容开头。前言为空则原样返回内容。"""
+    if not preface:
+        return prompt
+    return preface.rstrip() + "\n" + prompt
 
 
 def load_config_file(path=None):
@@ -102,6 +124,9 @@ def load_config_file(path=None):
         'single_dt': None,          # 保留原始字符串，按需再解析
         'loop_start_dt': None,
         'loop_end_dt': None,
+        'preface': '',
+        'suffix': '',
+        'suffix_delay': 0,
         'prompts': [],
     }
     if not os.path.exists(path):
@@ -109,6 +134,13 @@ def load_config_file(path=None):
     try:
         parser = configparser.ConfigParser(interpolation=None)
         parser.read(path, encoding='utf-8')
+    except UnicodeDecodeError:
+        # 外部工具可能以 GBK 保存 ini：UTF-8 解码失败时回退 GBK，避免静默丢失配置
+        try:
+            parser = configparser.ConfigParser(interpolation=None)
+            parser.read(path, encoding='gbk')
+        except Exception:
+            return cfg
     except Exception:
         return cfg
 
@@ -121,7 +153,13 @@ def load_config_file(path=None):
         for key in ('interval_min', 'click_x', 'click_y'):
             if key in g:
                 try:
-                    cfg[key] = int(float(g[key].strip().strip('"')))
+                    val = int(float(g[key].strip().strip('"')))
+                    # 手改 ini 越界值安全夹紧：间隔 1~1440 分钟，坐标 0~32767
+                    if key == 'interval_min':
+                        val = max(1, min(1440, val))
+                    else:
+                        val = max(0, min(32767, val))
+                    cfg[key] = val
                 except Exception:
                     pass
         if 'run_immediately' in g:
@@ -130,6 +168,17 @@ def load_config_file(path=None):
         for key in ('window_title',):
             if key in g and g[key].strip():
                 cfg[key] = g[key].strip().strip('"')
+
+        if g.get('preface'):
+            cfg['preface'] = g['preface']
+        if g.get('suffix'):
+            cfg['suffix'] = g['suffix']
+        if 'suffix_delay' in g:
+            try:
+                val = int(float(g['suffix_delay'].strip().strip('"')))
+                cfg['suffix_delay'] = max(0, min(86400, val))
+            except Exception:
+                pass
 
         # 日期时间字段：解析字符串 → datetime
         for key in ('single_dt', 'loop_start_dt', 'loop_end_dt'):
@@ -168,20 +217,34 @@ def save_config_file(cfg, path=None):
         parser['general']['click_x'] = str(gen.get('click_x', 0))
         parser['general']['click_y'] = str(gen.get('click_y', 0))
         parser['general']['window_title'] = str(gen.get('window_title', ''))
+        parser['general']['preface'] = str(gen.get('preface', ''))
+        parser['general']['suffix'] = str(gen.get('suffix', ''))
+        parser['general']['suffix_delay'] = str(int(gen.get('suffix_delay', 0)))
         for dt_key in ('single_dt', 'loop_start_dt', 'loop_end_dt'):
             val = gen.get(dt_key, '')
             parser['general'][dt_key] = val.strftime('%Y-%m-%d %H:%M:%S') if hasattr(val, 'strftime') else str(val if val else '')
 
-        # 发送内容：多个提示词用 === 分隔写入至 [prompts] 的 content
+        # 发送内容：多个提示词用不可见分隔符（PROMPT_SEP）写入 [prompts] 的 content
         prompts = gen.get('prompts') if 'prompts' in gen else cfg.get('prompts', [])
         if not parser.has_section('prompts'):
             parser.add_section('prompts')
-        parser.set('prompts', 'content', '\n---\n'.join(prompts))
+        parser.set('prompts', 'content', PROMPT_SEP.join(prompts))
 
-        with open(path, 'w', encoding='utf-8') as f:
+        # 原子写入：先写临时文件再 os.replace，避免掉电/崩溃留下半写文件损坏配置
+        tmp_path = path + '.tmp'
+        # 仅清理本配置文件自身的历史残留同名 tmp（不动其它实例的 tmp，消除多实例并发误删）
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             parser.write(f)
-    except Exception:
-        pass
+        os.replace(tmp_path, path)
+    except Exception as e:
+        # 不吞异常：让上层感知写盘失败（如 _persist 需据此保持 dirty 保护编辑内容）
+        print(f"[配置写盘失败] {e}")
+        raise
 
 
 def is_admin():
@@ -200,24 +263,64 @@ def force_foreground_window(hwnd):
     current_tid = kernel32.GetCurrentThreadId()
     target_tid, _ = win32process.GetWindowThreadProcessId(hwnd)
     attached = False
+    ok_fore = False
     if current_tid != target_tid:
         attached = bool(user32.AttachThreadInput(current_tid, target_tid, True))
     try:
         win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
         win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
-        user32.SetForegroundWindow(hwnd)
+        ok_fore = bool(user32.SetForegroundWindow(hwnd))
         user32.BringWindowToTop(hwnd)
         user32.SetActiveWindow(hwnd)
     finally:
         if attached:
             user32.AttachThreadInput(current_tid, target_tid, False)
     time.sleep(0.15)
+    # 仅以 SetForegroundWindow 返回值提示；不额外做 GetForegroundWindow 即时比对，
+    # 因 Windows 前台切入为异步，即时比对会因窗口尚未落定而高频误报
+    if not ok_fore:
+        print("[提示] SetForegroundWindow 返回失败（可能受系统前台限制），发送将照常尝试；若落点异常请确认目标窗口权限。")
     return True
 
 
+# 跨实例发送互斥锁：同一时刻只允许一个实例执行发送关键段，规避多开冲突
+_SEND_MUTEX = win32event.CreateMutex(None, False, "Local\\WindowsLoopSend_SendMutex")
+
+
 def click_and_paste_send(hwnd, text, click_pos=None):
-    """点击 → 剪贴板粘贴 → 回车"""
+    """点击 → 剪贴板粘贴 → 回车。
+    发送动作前先全屏锁定鼠标/键盘输入（提前1秒），发送完成后自动解锁。
+    BlockInput 模拟输入不受影响；需管理员权限，否则静默跳过锁定。
+
+    多实例冲突规避：以进程级命名互斥锁保护整个发送关键段（复制剪贴板 +
+    点击 + 粘贴 + 回车）。同一时刻只允许一个实例执行为止，其余实例排队，
+    等待超时(30s)则返回失败、不发送，彻底规避并发剪贴板/焦点/输入竞争。
+    """
+    owned = False
     try:
+        hr = win32event.WaitForSingleObject(_SEND_MUTEX, 30000)
+        # WAIT_ABANDONED 也代表本线程已获得所有权（另一实例在关键段内被强杀），
+        # 必须一并视为 owned，否则所有权泄漏导致后续发送持续失败
+        owned = hr in (win32event.WAIT_OBJECT_0, win32event.WAIT_ABANDONED)
+        if hr == win32event.WAIT_ABANDONED:
+            print("[提示] 上次发送被强制终止，已接管发送互斥锁并继续。")
+    except Exception as e:
+        print(f"发送失败：获取发送互斥锁异常 {e}")
+        return False
+    if not owned:
+        print("发送失败：等待发送互斥锁超时(>30s)，已跳过本条以规避并发输入竞争。")
+        return False
+    blocked = False
+    try:
+        # 提前1秒锁定真实鼠标键盘输入（未提权成功则 blocked 保持 False，正常发送）
+        try:
+            if user32.BlockInput(True):
+                blocked = True
+        except Exception:
+            pass
+        if blocked:
+            time.sleep(1.0)
+
         if not force_foreground_window(hwnd):
             return False
         if click_pos and click_pos[0] > 0 and click_pos[1] > 0:
@@ -243,6 +346,18 @@ def click_and_paste_send(hwnd, text, click_pos=None):
     except Exception as e:
         print(f"发送异常: {e}")
         return False
+    finally:
+        # 无论成功/失败/异常，发送结束都解锁鼠标键盘，避免锁死
+        if blocked:
+            try:
+                user32.BlockInput(False)
+            except Exception:
+                pass
+        if owned:
+            try:
+                win32event.ReleaseMutex(_SEND_MUTEX)
+            except Exception:
+                pass
 
 
 def list_all_windows():
@@ -311,6 +426,11 @@ QWidget {
 QMainWindow {
     background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
         stop:0 #0a1628, stop:0.5 #0b1c36, stop:1 #091524);
+}
+
+/* 文字标签一律透明背景，避免继承 QWidget 默认底色形成黑块 */
+QLabel {
+    background: transparent;
 }
 
 /* ===== 卡片 ===== */
@@ -713,6 +833,24 @@ class TargetPickerLabel(QFrame):
 #  调度线程
 # ═══════════════════════════════════════════════════════════════
 
+class TestSendThread(QThread):
+    """「立即测试」发送在后台线程执行，避免占用 GUI 主线程导致界面冻结。"""
+    done_signal = Signal(bool)
+
+    def __init__(self, hwnd, text, click_pos, parent=None):
+        super().__init__(parent)
+        self.hwnd = hwnd
+        self.text = text
+        self.click_pos = click_pos
+
+    def run(self):
+        try:
+            ok = click_and_paste_send(self.hwnd, self.text, self.click_pos)
+        except Exception:
+            ok = False
+        self.done_signal.emit(ok)
+
+
 class SchedulerWorker(QThread):
     log_signal = Signal(str)
     status_signal = Signal(str)       # idle / running / done
@@ -723,6 +861,9 @@ class SchedulerWorker(QThread):
         self.config = config
         self.prompts = config['prompts']
         self.strategy = config['strategy']
+        self.preface = config.get('preface', '')
+        self.suffix = config.get('suffix', '')
+        self.suffix_delay = int(config.get('suffix_delay', 0))
         self.prompt_index = 0
 
     def pick_prompt(self):
@@ -783,10 +924,24 @@ class SchedulerWorker(QThread):
             now = datetime.datetime.now()
             if now >= next_fire:
                 self.log_signal.emit("⏰ 触发 — 正在聚焦并发送...")
-                ok = click_and_paste_send(hwnd, self.pick_prompt(), click_pos)
+                ok = click_and_paste_send(hwnd, compose_send_text(self.preface, self.pick_prompt()), click_pos)
                 self.log_signal.emit("✅ 发送成功。" if ok else "❌ 发送失败。")
 
-                next_fire = self._next_fire(next_fire)
+                # 追加后续：延时指定时长后再发送
+                if self.suffix.strip() and self.suffix_delay > 0:
+                    self.log_signal.emit(f"🕒 {self.suffix_delay} 秒后发送追加后续...")
+                    remaining = float(self.suffix_delay)
+                    while remaining > 0 and not self.isInterruptionRequested():
+                        time.sleep(min(0.2, remaining))
+                        remaining -= 0.2
+                    if not self.isInterruptionRequested():
+                        ok2 = click_and_paste_send(hwnd, self.suffix, click_pos)
+                        self.log_signal.emit("✅ 追加后续已发送。" if ok2 else "❌ 追加后续发送失败。")
+
+                # 以实际完成时刻作为下一调度基线：若主发送+追加后续耗时较长，
+                # 可避免 next_fire 仍落在过去导致背靠背二次发送
+                now = datetime.datetime.now()
+                next_fire = self._next_fire(now)
                 if next_fire is None:
                     self.log_signal.emit("🏁 全部任务已完成，调度结束。")
                     break
@@ -808,9 +963,12 @@ class SchedulerWorker(QThread):
 # ═══════════════════════════════════════════════════════════════
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, instance_name=''):
         super().__init__()
-        title = "定时自动发送工具"
+        self.instance_name = instance_name
+        title = "定时自动发送工具  - yezijinn"
+        if instance_name:
+            title += f" · {instance_name}"
         if is_admin():
             title += "  ·  管理员模式"
         self.setWindowTitle(title)
@@ -820,10 +978,11 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.prompt_cards = []
         self.next_fire_time = None  # 用于倒计时显示
-        self._config_file = default_config_file()
+        self._config_file = default_config_file(instance_name)
         self._loading = True     # 初始化期间抑制自动保存
         self._initializing = True  # 覆盖整个构造期（_set_mode 会再触发保存）
         self._pending_save = False
+        self._dirty = False        # 标记是否有未落盘的本地改动，用于保护热更新不被覆盖
         self._watcher = QFileSystemWatcher(self)
         if os.path.exists(self._config_file):
             self._watcher.addPath(self._config_file)
@@ -905,16 +1064,42 @@ class MainWindow(QMainWindow):
         # ─── 顶部状态栏 ───
         header = QHBoxLayout()
         header.setSpacing(10)
-        title_lbl = QLabel("⏱️  定时自动发送")
+        title_lbl = QLabel("⏱️  定时发送")
         title_lbl.setStyleSheet("font-size: 15pt; font-weight: 700; color: #ffffff;")
         header.addWidget(title_lbl)
+        header.addSpacing(12)
+
+        btn_save_cfg = QPushButton("💾 保存配置")
+        btn_save_cfg.setProperty("class", "btn-ghost")
+        btn_save_cfg.setMinimumHeight(26)
+        btn_save_cfg.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save_cfg.setToolTip("立即把当前配置写入本地配置文件")
+        btn_save_cfg.clicked.connect(self._save_config_now)
+        header.addWidget(btn_save_cfg)
+
+        btn_import_cfg = QPushButton("📥 导入配置")
+        btn_import_cfg.setProperty("class", "btn-ghost")
+        btn_import_cfg.setMinimumHeight(26)
+        btn_import_cfg.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_import_cfg.setToolTip("从本地 ini 文件导入配置到当前窗口")
+        btn_import_cfg.clicked.connect(self._import_config_file)
+        header.addWidget(btn_import_cfg)
+
+        btn_reset_cfg = QPushButton("♻️ 恢复出厂")
+        btn_reset_cfg.setProperty("class", "btn-ghost")
+        btn_reset_cfg.setMinimumHeight(26)
+        btn_reset_cfg.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_reset_cfg.setToolTip("将当前窗口配置恢复为出厂默认（发送内容等全部清空）")
+        btn_reset_cfg.clicked.connect(self._reset_factory_config)
+        header.addWidget(btn_reset_cfg)
+
         header.addStretch()
 
         self.lbl_now = QLabel()
         self.lbl_now.setStyleSheet("color: #7a93c0; font-size: 9.5pt;")
         header.addWidget(self.lbl_now)
 
-        self.status_pill = QLabel("● 待命中")
+        self.status_pill = QLabel("● 无任务  空闲状态")
         self.status_pill.setProperty("class", "status-pill")
         self.status_pill.setProperty("state", "idle")
         self.status_pill.setStyle(self.style())  # 刷新属性
@@ -967,26 +1152,33 @@ class MainWindow(QMainWindow):
         bar = QHBoxLayout()
         bar.setSpacing(10)
 
-        self.btn_toggle = QPushButton("▶  启动定时")
+        self.btn_toggle = QPushButton("启动定时")
         self.btn_toggle.setProperty("class", "btn-primary")
         self.btn_toggle.setMinimumHeight(44)
         self.btn_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_toggle.clicked.connect(self.toggle_task)
         bar.addWidget(self.btn_toggle, 2)
 
-        btn_test = QPushButton("⚡  立即测试")
+        btn_test = QPushButton("立即测试")
         btn_test.setProperty("class", "btn-secondary")
         btn_test.setMinimumHeight(44)
         btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_test.clicked.connect(self.test_trigger)
         bar.addWidget(btn_test, 1)
 
-        btn_refresh = QPushButton("🔄  刷新预览")
+        btn_refresh = QPushButton("刷新预览")
         btn_refresh.setProperty("class", "btn-secondary")
         btn_refresh.setMinimumHeight(44)
         btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_refresh.clicked.connect(self._refresh_schedule_preview)
         bar.addWidget(btn_refresh, 1)
+
+        btn_new = QPushButton("新建窗口 用于新目标")
+        btn_new.setProperty("class", "btn-ghost")
+        btn_new.setMinimumHeight(44)
+        btn_new.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_new.clicked.connect(self._new_window)
+        bar.addWidget(btn_new, 1)
 
         root.addLayout(bar)
 
@@ -1040,6 +1232,56 @@ class MainWindow(QMainWindow):
         layout.addLayout(row1)
 
     def _build_content_card(self, layout):
+        # 附加前言（每次发送时自动置于内容开头）
+        preface_head = QHBoxLayout()
+        title_lbl = QLabel("[附加前言]")
+        title_lbl.setStyleSheet("font-size: 9.5pt; font-weight: 700; color: #9fb7e6;")
+        preface_head.addWidget(title_lbl)
+        tip_lbl = QLabel("每一次发送时 自动将文本置于每一条发送内容的开头")
+        tip_lbl.setStyleSheet("color: #5f739a; font-size: 8.5pt;")
+        preface_head.addWidget(tip_lbl)
+        preface_head.addStretch()
+        layout.addLayout(preface_head)
+
+        self.preface_edit = QPlainTextEdit()
+        self.preface_edit.setPlaceholderText("（可选）在每条发送内容的开头 附加这一份相同内容...")
+        self.preface_edit.setFixedHeight(int(self.preface_edit.fontMetrics().lineSpacing() * 3) + 12)
+        self.preface_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.preface_edit.textChanged.connect(self._on_ui_changed_for_save)
+        layout.addWidget(self.preface_edit)
+
+        # 追加后续（发送主内容后，延时指定时长再发送）
+        suffix_head = QHBoxLayout()
+        s_title = QLabel("[追加后续]")
+        s_title.setStyleSheet("font-size: 9.5pt; font-weight: 700; color: #9fb7e6;")
+        suffix_head.addWidget(s_title)
+        s_tip = QLabel("发送每一条主内容之后 延时发送这里补充的内容")
+        s_tip.setStyleSheet("color: #5f739a; font-size: 8.5pt;")
+        suffix_head.addWidget(s_tip)
+        suffix_head.addStretch()
+        layout.addLayout(suffix_head)
+
+        self.suffix_edit = QPlainTextEdit()
+        self.suffix_edit.setPlaceholderText("（可选）每一次发送主内容之后 再延迟追加的后续内容...")
+        self.suffix_edit.setFixedHeight(int(self.suffix_edit.fontMetrics().lineSpacing() * 3) + 12)
+        self.suffix_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.suffix_edit.textChanged.connect(self._on_ui_changed_for_save)
+        layout.addWidget(self.suffix_edit)
+
+        delay_row = QHBoxLayout()
+        delay_row.setSpacing(8)
+        delay_row.addWidget(QLabel("追加延时:"))
+        self.suffix_delay_spin = QSpinBox()
+        self.suffix_delay_spin.setRange(0, 86400)
+        self.suffix_delay_spin.setValue(30)
+        self.suffix_delay_spin.setSuffix(" 秒")
+        self.suffix_delay_spin.setMinimumHeight(26)
+        self.suffix_delay_spin.valueChanged.connect(self._on_ui_changed_for_save)
+        delay_row.addWidget(self.suffix_delay_spin)
+        delay_row.addWidget(QLabel("（循环模式，不得超过任务间隔，避免冲突）"))
+        delay_row.addStretch()
+        layout.addLayout(delay_row)
+
         # 滚动区
         self.prompt_scroll = QScrollArea()
         self.prompt_scroll.setWidgetResizable(True)
@@ -1057,13 +1299,13 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout()
         bottom.setSpacing(10)
 
-        btn_add = QPushButton("➕ 添加一条")
+        btn_add = QPushButton("➕ 添加一条内容")
         btn_add.setProperty("class", "btn-ghost")
         btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_add.clicked.connect(lambda: self.add_prompt_card())
         bottom.addWidget(btn_add)
 
-        btn_import = QPushButton("📂 导入文件")
+        btn_import = QPushButton("📂 导入.txt内容(用---分割)")
         btn_import.setProperty("class", "btn-ghost")
         btn_import.setToolTip("导入 .txt / .md，用 --- 分隔多条发送内容")
         btn_import.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1071,10 +1313,10 @@ class MainWindow(QMainWindow):
         bottom.addWidget(btn_import)
 
         bottom.addSpacing(10)
-        bottom.addWidget(QLabel("策略:"))
+        bottom.addWidget(QLabel("多条内容的发送方案:"))
         self.combo_strategy = QComboBox()
-        self.combo_strategy.addItem("顺序循环")
-        self.combo_strategy.addItem("随机发送")
+        self.combo_strategy.addItem("按顺序")
+        self.combo_strategy.addItem("纯随机")
         self.combo_strategy.currentIndexChanged.connect(self._on_ui_changed_for_save)
         bottom.addWidget(self.combo_strategy)
 
@@ -1090,7 +1332,7 @@ class MainWindow(QMainWindow):
         seg_row = QHBoxLayout()
         seg_row.addStretch()
 
-        self.btn_seg_single = QPushButton("单次")
+        self.btn_seg_single = QPushButton("单次发送")
         self.btn_seg_single.setProperty("class", "seg-btn seg-btn-left")
         self.btn_seg_single.setProperty("active", True)
         self.btn_seg_single.setCheckable(True)
@@ -1098,7 +1340,7 @@ class MainWindow(QMainWindow):
         self.btn_seg_single.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_seg_single.clicked.connect(lambda: self._set_mode("single"))
 
-        self.btn_seg_loop = QPushButton("循环")
+        self.btn_seg_loop = QPushButton("循环发送")
         self.btn_seg_loop.setProperty("class", "seg-btn seg-btn-right")
         self.btn_seg_loop.setProperty("active", False)
         self.btn_seg_loop.setCheckable(True)
@@ -1131,7 +1373,7 @@ class MainWindow(QMainWindow):
         self.single_dt.setMinimumHeight(30)
         sp.addWidget(self.single_dt)
 
-        s_hint = QLabel("到点自动发送一次，然后停止 · 时间已过会在启动时询问是否顺延")
+        s_hint = QLabel("到点自动发送一次，然后停止")
         s_hint.setStyleSheet("color: #5a7ab0; font-size: 8.5pt;")
         s_hint.setWordWrap(True)
         sp.addWidget(s_hint)
@@ -1208,6 +1450,7 @@ class MainWindow(QMainWindow):
         self.loop_end_dt.dateTimeChanged.connect(self._on_ui_changed_for_save)
         self.spin_interval.valueChanged.connect(self._refresh_schedule_preview)
         self.spin_interval.valueChanged.connect(self._on_ui_changed_for_save)
+        self.spin_interval.valueChanged.connect(lambda _: self._sync_suffix_limit())
         self.chk_immediate.toggled.connect(self._refresh_schedule_preview)
         self.chk_immediate.toggled.connect(self._on_ui_changed_for_save)
 
@@ -1243,8 +1486,23 @@ class MainWindow(QMainWindow):
 
         self.single_panel.setVisible(is_single)
         self.loop_panel.setVisible(not is_single)
+        self._sync_suffix_limit()
         self._refresh_schedule_preview()
         self._on_ui_changed_for_save()
+
+    def _sync_suffix_limit(self):
+        """循环模式：追加后续延时不得超过任务间隔，避免与下一次触发冲突。"""
+        spin = getattr(self, 'suffix_delay_spin', None)
+        if spin is None:
+            return
+        is_single = self.btn_seg_single.property("active")
+        if is_single:
+            spin.setMaximum(86400)
+        else:
+            spin.setMaximum(max(1, self.spin_interval.value() * 60 - 1))
+        # 若当前值超上限则自动收紧
+        if spin.value() > spin.maximum():
+            spin.setValue(spin.maximum())
 
     def _on_mode_changed(self):
         # 初始化时根据默认选中状态设置面板可见性
@@ -1256,6 +1514,7 @@ class MainWindow(QMainWindow):
         """任何 UI 改动 → 立即持久化（含热更新的本地回写）。"""
         if self._is_loading():
             return
+        self._dirty = True
         self._pending_save = True
         if not hasattr(self, '_debounce_timer'):
             self._debounce_timer = QTimer(self)
@@ -1289,6 +1548,9 @@ class MainWindow(QMainWindow):
             'single_dt': self._combine_dt(self.single_dt),
             'loop_start_dt': self._combine_dt(self.loop_start_dt),
             'loop_end_dt': self._combine_dt(self.loop_end_dt),
+            'preface': self.preface_edit.toPlainText(),
+            'suffix': self.suffix_edit.toPlainText(),
+            'suffix_delay': self.suffix_delay_spin.value(),
             'prompts': self.get_prompt_list(),
         }
 
@@ -1301,6 +1563,11 @@ class MainWindow(QMainWindow):
             pass
         try:
             save_config_file({'general': self._collect_persist_dict()}, self._config_file)
+            self._dirty = False
+        except Exception as e:
+            # 写盘失败：保持 dirty，避免误判已保存而失去对未落盘编辑的保护
+            self._dirty = True
+            print(f"[保存失败] 配置写入未成功：{e}")
         finally:
             try:
                 if os.path.exists(self._config_file):
@@ -1349,6 +1616,9 @@ class MainWindow(QMainWindow):
         if not prompts:
             prompts = [""]
         self._set_prompts(prompts)
+        self.preface_edit.setPlainText(cfg.get('preface', ''))
+        self.suffix_edit.setPlainText(cfg.get('suffix', ''))
+        self.suffix_delay_spin.setValue(int(cfg.get('suffix_delay', 0)))
 
         self._set_loading_flag(False)
         self._refresh_schedule_preview()
@@ -1368,6 +1638,9 @@ class MainWindow(QMainWindow):
         self._reload_timer.start(400)
 
     def _reload_from_disk(self):
+        if getattr(self, '_dirty', False):
+            self._append_log("⚠️  检测到本地未保存改动，已跳过文件热更新以保护正在编辑的内容。")
+            return
         cfg = load_config_file(self._config_file)
         self._apply_config(cfg)
         self._append_log("🔄  配置热更新：已重新加载 config-win-auto-sender.ini")
@@ -1535,11 +1808,25 @@ class MainWindow(QMainWindow):
                 pass
             else:
                 self.lbl_countdown.setText("--:--:--")
-                self.lbl_countdown_label.setText("待命中 · 配置好后点启动")
+                self.lbl_countdown_label.setText("待命中 · 配置好后点 启动定时")
 
-        # 非运行时每秒刷新预览（让"已过去"的提示实时更新）
+        # 非运行时刷新预览：避免每秒全量重建。单次需秒级感知“已过去”翻转，
+        # 循环列表不随秒变化，仅按分钟 + 配置值变化刷新（配置改动自身也会触发刷新）。
         if not (self.worker and self.worker.isRunning()):
-            self._refresh_schedule_preview()
+            mode = "single" if self.btn_seg_single.property("active") else "loop"
+            if mode == "single":
+                fd = self._combine_dt(self.single_dt)
+                key = "s:%s:%s" % (fd.strftime("%Y%m%d%H%M%S"), now.strftime("%Y%m%d%H%M%S"))
+            else:
+                key = "l:%s:%s:%s:%s:%s" % (
+                    self._combine_dt(self.loop_start_dt).strftime("%Y%m%d%H%M%S"),
+                    self._combine_dt(self.loop_end_dt).strftime("%Y%m%d%H%M%S"),
+                    self.spin_interval.value(),
+                    self.chk_immediate.isChecked(),
+                    now.strftime("%Y%m%d%H%M"))
+            if key != getattr(self, '_prev_preview_key', None):
+                self._refresh_schedule_preview()
+                self._prev_preview_key = key
 
     def _refresh_schedule_preview(self):
         self.list_schedule.clear()
@@ -1631,6 +1918,13 @@ class MainWindow(QMainWindow):
             if start_dt >= end_dt:
                 QMessageBox.warning(self, "配置错误", "开始时间必须早于结束时间！")
                 return None
+            # 追加后续延时不得超过任务间隔，避免与下一次触发冲突
+            suffix_min = self.suffix_delay_spin.value() / 60.0
+            if self.suffix_delay_spin.value() > 0 and suffix_min >= self.spin_interval.value():
+                QMessageBox.warning(
+                    self, "配置错误",
+                    "追加后续的延时时长必须小于循环发送的间隔时长，否则会与下一次触发冲突。")
+                return None
 
         return {
             'hwnd': hwnd,
@@ -1642,9 +1936,26 @@ class MainWindow(QMainWindow):
             'end_dt': end_dt,
             'interval_min': self.spin_interval.value(),
             'run_immediately': self.chk_immediate.isChecked(),
+            'preface': self.preface_edit.toPlainText(),
+            'suffix': self.suffix_edit.toPlainText(),
+            'suffix_delay': self.suffix_delay_spin.value(),
         }
 
     # ── 任务控制 ─────────────────────────────────────────────
+
+    def _new_window(self):
+        """新开一个程序窗口，用于新的目标窗口：自动生成唯一实例名，独立进程/独立配置。"""
+        name = "w" + uuid.uuid4().hex[:8]
+        if getattr(sys, 'frozen', False):
+            args = [sys.executable, "--name", name]
+        else:
+            args = [sys.executable, os.path.abspath(__file__), "--name", name]
+        try:
+            subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        except Exception as e:
+            QMessageBox.warning(self, "无法新开窗口", "启动新实例失败：%s" % e)
+            return
+        self._append_log(f"已新开窗口（实例 {name}），用于新的目标窗口。")
 
     def toggle_task(self):
         if self.worker and self.worker.isRunning():
@@ -1705,14 +2016,33 @@ class MainWindow(QMainWindow):
         cfg = self._collect_config(for_test=True)
         if not cfg:
             return
+        # 互斥守卫：上一次测试仍在发送时拒绝再开，杜绝覆盖引用导致线程孤儿崩溃
+        if getattr(self, '_test_busy', False):
+            self._append_log("⚠️  已有一次测试发送进行中，请稍候再试。")
+            return
         self._append_log("⚡  执行测试发送...")
         prompts = cfg['prompts']
         prompt = random.choice(prompts) if cfg['strategy'] == 'random' else prompts[0]
-        ok = click_and_paste_send(cfg['hwnd'], prompt, cfg['click_pos'])
+        text = compose_send_text(cfg.get('preface', ''), prompt)
+        # 后台线程发送，防止阻塞 GUI（发送含提前 1s 锁输入 + 键鼠模拟，内部互斥排队最坏数秒）
+        self._test_busy = True
+        self._test_thread = TestSendThread(cfg['hwnd'], text, cfg['click_pos'])
+        self._test_thread.done_signal.connect(self._on_test_done)
+        try:
+            self._test_thread.start()
+        except Exception as e:
+            # 启动失败时复位 busy，避免永久锁死后续测试
+            self._test_busy = False
+            self._test_thread = None
+            self._append_log(f"❌  启动测试发送失败：{e}")
+
+    def _on_test_done(self, ok):
+        self._test_busy = False
         if ok:
             self._append_log("✅  测试完成：已聚焦并发送。")
         else:
             self._append_log("❌  测试失败：请确认目标窗口权限是否高于本程序。")
+        self._test_thread = None
 
     # ── 日志 ────────────────────────────────────────────────
 
@@ -1730,7 +2060,127 @@ class MainWindow(QMainWindow):
             self.worker.requestInterruption()
             while not self.worker.wait(100):
                 QApplication.processEvents()
+        tt = getattr(self, '_test_thread', None)
+        if tt and tt.isRunning():
+            # 测试发送内含最长约 30s 的发送互斥等待，轮询等待其结束，避免孤儿线程残留
+            waited = 0
+            while tt.isRunning() and waited < 35000:
+                tt.wait(200)
+                waited += 200
+                QApplication.processEvents()
+        if not self._cleanup_tmp_config():
+            event.ignore()
+            return
         event.accept()
+
+    def _cleanup_tmp_config(self):
+        """附属窗口（--name）关闭时的配置回收策略，返回是否允许关闭。
+        未配置任何内容 → 判定为垃圾直接删除，不打扰；
+        已配置内容 → 弹窗询问保留或删除，由用户决定，避免误删；
+        默认窗口绝不处理。
+        """
+        if not self.instance_name:
+            return True
+        # 先把当前内存 UI 状态真正落盘，避免 400ms 防抖尚未写盘的编辑被误判为空而删除
+        try:
+            self._flush_pending_save()
+        except Exception:
+            pass
+        try:
+            cfg = load_config_file(self._config_file)
+        except Exception:
+            cfg = {}
+        has_data = bool(any(cfg.get('prompts') or [])) or bool(cfg.get('window_title')) \
+            or bool(cfg.get('preface')) or bool(cfg.get('suffix'))
+        if not has_data:
+            try:
+                if os.path.exists(self._config_file):
+                    os.remove(self._config_file)
+                    print(f"[清理] 已删除未使用的实例配置: {self._config_file}")
+            except Exception:
+                pass
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("关闭实例")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"实例「{self.instance_name}」已配置了发送内容。\n关闭后该实例配置文件何处理？")
+        box.setInformativeText(self._config_file)
+        keep_btn = box.addButton("保留配置", QMessageBox.ButtonRole.AcceptRole)
+        del_btn = box.addButton("删除配置", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("取消关闭", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is del_btn:
+            try:
+                if os.path.exists(self._config_file):
+                    os.remove(self._config_file)
+                    print(f"[清理] 已删除实例配置: {self._config_file}")
+            except Exception:
+                pass
+            return True
+        if clicked is keep_btn:
+            print(f"[保留] 实例「{self.instance_name}」配置保留于: {self._config_file}")
+            return True
+        print("[取消] 已取消关闭窗口。")
+        return False
+
+    # ── 配置管理：保存 / 导入 / 恢复出厂 ─────────────────────────────
+
+    def _save_config_now(self):
+        """手动立即保存当前配置到本地配置文件（替代仅靠防抖后台保存）。"""
+        self._persist()
+        self._append_log(f"💾 已保存配置：{self._config_file}")
+
+    def _import_config_file(self):
+        """从用户选择的 ini 文件导入配置到当前窗口，并覆盖当前窗口的配置文件。"""
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "不可导入", "任务运行中，请先停止再导入配置。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择要导入的配置文件", _script_dir(),
+            "配置文件 (*.ini *.INI);;所有文件 (*.*)")
+        if not path:
+            return
+        try:
+            cfg = load_config_file(path)
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", "无法解析配置文件：%s" % e)
+            return
+        self._apply_config(cfg)
+        self._persist()
+        self._append_log(f"✅ 已从 {path} 导入配置到当前窗口。")
+
+    def _reset_factory_config(self):
+        """把当前窗口配置恢复为出厂默认（清空发送内容、重置全部参数）。"""
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "不可重置", "任务运行中，请先停止再恢复出厂。")
+            return
+        reply = QMessageBox.question(
+            self, "恢复出厂",
+            "将清空当前窗口的全部发送内容与设置，恢复出厂默认。\n确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        now = datetime.datetime.now()
+        default_cfg = {
+            'mode': 'single',
+            'strategy': 'sequence',
+            'interval_min': 10,
+            'run_immediately': False,
+            'click_x': 0,
+            'click_y': 0,
+            'window_title': '',
+            'single_dt': now + datetime.timedelta(seconds=60),
+            'loop_start_dt': now + datetime.timedelta(seconds=60),
+            'loop_end_dt': now + datetime.timedelta(days=7),
+            'preface': '',
+            'suffix': '',
+            'suffix_delay': 0,
+            'prompts': [''],
+        }
+        self._apply_config(default_cfg)
+        self._persist()
+        self._append_log("♻️  已恢复出厂默认配置。")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1738,10 +2188,21 @@ class MainWindow(QMainWindow):
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
+    # 支持实例名 --name/-n：每个实例使用独立配置文件，实现数据/配置完全隔离
+    instance_name = ''
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a in ('--name', '-n') and i + 1 < len(args):
+            instance_name = args[i + 1].strip()
+    # 实例名做白名单校验，防路径穿越（../ 或含 / \ .. 等绕过 exe 同级目录）
+    if instance_name and not re.fullmatch(r'[A-Za-z0-9_\-]+', instance_name):
+        print(f"[忽略] 非法实例名「{instance_name}」，已回退为默认实例。")
+        instance_name = ''
+
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     font = QFont("Microsoft YaHei UI", 9)
     app.setFont(font)
-    win = MainWindow()
+    win = MainWindow(instance_name)
     win.show()
     sys.exit(app.exec())
