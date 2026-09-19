@@ -983,6 +983,7 @@ class MainWindow(QMainWindow):
         self._initializing = True  # 覆盖整个构造期（_set_mode 会再触发保存）
         self._pending_save = False
         self._dirty = False        # 标记是否有未落盘的本地改动，用于保护热更新不被覆盖
+        self._user_touched = False # 标记用户是否真实改动过本实例（用于默认窗口关闭时静默删除）
         self._watcher = QFileSystemWatcher(self)
         if os.path.exists(self._config_file):
             self._watcher.addPath(self._config_file)
@@ -1514,6 +1515,8 @@ class MainWindow(QMainWindow):
         """任何 UI 改动 → 立即持久化（含热更新的本地回写）。"""
         if self._is_loading():
             return
+        # 用户在界面上真实改动过；程序回填（初始化/热更新）在 _is_loading 时已提前 return
+        self._user_touched = True
         self._dirty = True
         self._pending_save = True
         if not hasattr(self, '_debounce_timer'):
@@ -2086,6 +2089,15 @@ class MainWindow(QMainWindow):
             self._flush_pending_save()
         except Exception:
             pass
+        # 用户从未在界面上真实改动过（默认新建未使用）→ 视为垃圾，静默删除配置直接关闭，不打扰
+        if not self._user_touched:
+            try:
+                if os.path.exists(self._config_file):
+                    os.remove(self._config_file)
+                    print(f"[清理] 已删除未使用的实例配置: {self._config_file}")
+            except Exception:
+                pass
+            return True
         try:
             cfg = load_config_file(self._config_file)
         except Exception:
