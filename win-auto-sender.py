@@ -453,26 +453,41 @@ QLabel[class="card-icon"] {
 }
 
 /* ===== 分段控件 ===== */
-QPushButton[class="seg-btn"] {
+/* 注意：class 属性为 "seg-btn seg-btn-left" 这类多词值，须用 ~= 词匹配，= 精确匹配不会命中 */
+QPushButton[class~="seg-btn"] {
     background-color: #0e1c33;
     color: #7a93c0;
     border: 1px solid #1f3560;
     padding: 8px 22px;
     font-weight: 500;
 }
-QPushButton[class="seg-btn-left"] {
+QPushButton[class~="seg-btn-left"] {
     border-top-left-radius: 8px;
     border-bottom-left-radius: 8px;
     border-right: none;
 }
-QPushButton[class="seg-btn-right"] {
+QPushButton[class~="seg-btn-right"] {
     border-top-right-radius: 8px;
     border-bottom-right-radius: 8px;
 }
-QPushButton[class="seg-btn"][active="true"] {
+QPushButton[class~="seg-btn"][active="true"] {
     background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
         stop:0 #00b8ff, stop:1 #3d7bff);
     color: #ffffff;
+    border-color: #00b8ff;
+}
+
+/* 「获取此时」：与分段控件等高，独立圆角 */
+QPushButton[class="btn-now"] {
+    background-color: #0e1c33;
+    color: #00d4ff;
+    border: 1px solid #1f3560;
+    border-radius: 8px;
+    padding: 8px 18px;
+    font-weight: 500;
+}
+QPushButton[class="btn-now"]:hover {
+    background-color: rgba(0, 184, 255, 0.15);
     border-color: #00b8ff;
 }
 
@@ -1355,6 +1370,16 @@ class MainWindow(QMainWindow):
 
         seg_row.addWidget(self.btn_seg_single)
         seg_row.addWidget(self.btn_seg_loop)
+
+        # 「获取此时」：把当前激活面板的触发时间设为按下这一刻
+        self.btn_get_now = QPushButton("🕐 获取此时")
+        self.btn_get_now.setProperty("class", "btn-now")
+        self.btn_get_now.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_get_now.setToolTip("把触发时间设为按下按钮的当前时刻")
+        self.btn_get_now.clicked.connect(self._apply_now_time)
+        seg_row.addSpacing(8)
+        seg_row.addWidget(self.btn_get_now)
+
         seg_row.addStretch()
         layout.addLayout(seg_row)
 
@@ -1490,6 +1515,16 @@ class MainWindow(QMainWindow):
         self._sync_suffix_limit()
         self._refresh_schedule_preview()
         self._on_ui_changed_for_save()
+
+    def _apply_now_time(self):
+        """「获取此时」：把当前激活面板的触发时间设为按下这一刻。"""
+        now = QDateTime.currentDateTime()
+        if self.btn_seg_single.property("active"):
+            self.single_dt.setDateTime(now)
+            self._append_log(f"🕐 单次触发时间已设为当前时刻：{now.toString('yyyy-MM-dd HH:mm:ss')}")
+        else:
+            self.loop_start_dt.setDateTime(now)
+            self._append_log(f"🕐 循环开始时间已设为当前时刻：{now.toString('yyyy-MM-dd HH:mm:ss')}")
 
     def _sync_suffix_limit(self):
         """循环模式：追加后续延时不得超过任务间隔，避免与下一次触发冲突。"""
@@ -2071,10 +2106,24 @@ class MainWindow(QMainWindow):
                 tt.wait(200)
                 waited += 200
                 QApplication.processEvents()
+        # 先落盘未保存的编辑（防抖窗口内的改动），避免默认窗口关闭时丢失配置
+        self._flush_before_close()
         if not self._cleanup_tmp_config():
             event.ignore()
             return
         event.accept()
+
+    def _flush_before_close(self):
+        """关闭前把防抖窗口内尚未落盘的编辑写入配置，避免丢失刚改的内容。
+        默认窗口原先直接跳过清理分支，导致最后 400ms 内的改动被丢弃。"""
+        timer = getattr(self, '_debounce_timer', None)
+        if timer is not None:
+            timer.stop()
+        if getattr(self, '_pending_save', False) or getattr(self, '_dirty', False):
+            try:
+                self._flush_pending_save()
+            except Exception as e:
+                print(f"[关闭前保存失败] {e}")
 
     def _cleanup_tmp_config(self):
         """附属窗口（--name）关闭时的配置回收策略，返回是否允许关闭。
