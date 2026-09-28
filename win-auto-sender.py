@@ -14,6 +14,7 @@ import uuid
 import ctypes
 from ctypes import wintypes
 import configparser
+import json
 import pyperclip
 import win32gui
 import win32process
@@ -53,9 +54,16 @@ kernel32 = ctypes.windll.kernel32
 # ═══════════════════════════════════════════════════════════════
 
 PROMPT_SEP_RE = re.compile(r'^\s*-{3,}\s*$')   # --- 分割行
-# 内部持久化分隔符：含不可见控制符，普通提示词几乎不可能出现，
-# 避免内容含 === 或 --- 行时保存后重读被错误拆分（往返损坏）
+# 内部持久化分隔符（内存内使用）
 PROMPT_SEP = '\n\x1F-WindowLoopSend-SEPARATOR-\x1F\n'
+# 历史遗留：该分隔符写入 ini 后，configparser 读取多行值会剥离行首尾空白，
+# 而 Python 把 \x1F 也视作空白字符，导致 \x1F 被剥离、分隔符失效（多条内容被合并）。
+# 故此正则用于识别「已退化」的历史分隔行，把旧配置重新正确拆分。
+PROMPT_SEP_LEGACY_RE = re.compile(r'^[\s\x00-\x1f]*-WindowLoopSend-SEPARATOR-[\s\x00-\x1f]*$')
+
+# 单次触发时间的「已过去」容忍窗口（秒）。秒级精度下，把触发时间设为当前时刻
+# （如点「获取此时」）不应立刻被判为过期，否则每次都会弹「是否顺延」。
+PAST_TOLERANCE_SEC = 2
 
 
 def _script_dir():
@@ -75,8 +83,8 @@ def default_config_file(instance=''):
 
 def split_prompt_text(text):
     """把多提示词文本分割成若干条（兼容各种换行）。
-    - 若含内部不可见分隔符（PROMPT_SEP，程序写入），按它精确分割，无往返损坏
-    - 否则按 '---' 行分割（用户导入 .txt/.md 友好），开头/结尾无分隔符也识别
+    - 若含内部不可见分隔符（PROMPT_SEP，程序写入），按它精确分割
+    - 否则按分隔行分割（'---' 行，或历史遗留的 SEPARATOR 行；用户导入 .txt/.md 友好）
     返回非空字符串列表。
     """
     if not text:
@@ -88,7 +96,7 @@ def split_prompt_text(text):
         blocks = []
         cur = []
         for ln in lines:
-            if PROMPT_SEP_RE.match(ln):
+            if PROMPT_SEP_RE.match(ln) or PROMPT_SEP_LEGACY_RE.match(ln):
                 blocks.append(cur)
                 cur = []
             else:
@@ -108,6 +116,23 @@ def compose_send_text(preface, prompt):
     if not preface:
         return prompt
     return preface.rstrip() + "\n" + prompt
+
+
+def _decode_prompts(parser):
+    """解析 [prompts] 内容。新格式为 JSON 数组（format=json，单行、无空白剥离风险）；
+    旧格式回退按分隔行拆分。"""
+    if not parser.has_option('prompts', 'content'):
+        return []
+    raw = parser['prompts']['content']
+    fmt = parser['prompts'].get('format', '').strip() if parser.has_option('prompts', 'format') else ''
+    if fmt == 'json':
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [str(x).strip() for x in data if str(x).strip()]
+        except Exception:
+            pass
+    return split_prompt_text(raw)
 
 
 def load_config_file(path=None):
@@ -189,10 +214,8 @@ def load_config_file(path=None):
                 except Exception:
                     cfg[key] = g[key].strip().strip('"')
 
-    # 发送内容（支持多段文本，用 --- 分隔）
-    if parser.has_option('prompts', 'content'):
-        raw = parser['prompts']['content']
-        cfg['prompts'] = split_prompt_text(raw)
+    # 发送内容（多条发送内容）
+    cfg['prompts'] = _decode_prompts(parser)
     return cfg
 
 
@@ -224,11 +247,13 @@ def save_config_file(cfg, path=None):
             val = gen.get(dt_key, '')
             parser['general'][dt_key] = val.strftime('%Y-%m-%d %H:%M:%S') if hasattr(val, 'strftime') else str(val if val else '')
 
-        # 发送内容：多个提示词用不可见分隔符（PROMPT_SEP）写入 [prompts] 的 content
+        # 发送内容：以 JSON 数组写入 [prompts]（单行存储，避免 configparser
+        # 对多行值剥离行首尾空白而破坏分隔符）
         prompts = gen.get('prompts') if 'prompts' in gen else cfg.get('prompts', [])
         if not parser.has_section('prompts'):
             parser.add_section('prompts')
-        parser.set('prompts', 'content', PROMPT_SEP.join(prompts))
+        parser.set('prompts', 'format', 'json')
+        parser.set('prompts', 'content', json.dumps([str(p) for p in prompts], ensure_ascii=False))
 
         # 原子写入：先写临时文件再 os.replace，避免掉电/崩溃留下半写文件损坏配置
         tmp_path = path + '.tmp'
@@ -240,7 +265,19 @@ def save_config_file(cfg, path=None):
                 pass
         with open(tmp_path, 'w', encoding='utf-8') as f:
             parser.write(f)
-        os.replace(tmp_path, path)
+        # Windows 上目标文件可能被其它进程（编辑器/杀软/同名实例）瞬时占用导致
+        # os.replace 抛 PermissionError，做有限次短重试而非直接判定写盘失败
+        last_err = None
+        for attempt in range(3):
+            try:
+                os.replace(tmp_path, path)
+                last_err = None
+                break
+            except PermissionError as e:
+                last_err = e
+                time.sleep(0.06 * (attempt + 1))
+        if last_err is not None:
+            raise last_err
     except Exception as e:
         # 不吞异常：让上层感知写盘失败（如 _persist 需据此保持 dirty 保护编辑内容）
         print(f"[配置写盘失败] {e}")
@@ -1014,7 +1051,6 @@ class MainWindow(QMainWindow):
             self._persist()
         self._apply_config(initial)
 
-        self._on_mode_changed()
         self._refresh_schedule_preview()
         self._loading = False
         self._initializing = False
@@ -1115,7 +1151,7 @@ class MainWindow(QMainWindow):
         self.lbl_now.setStyleSheet("color: #7a93c0; font-size: 9.5pt;")
         header.addWidget(self.lbl_now)
 
-        self.status_pill = QLabel("● 无任务  空闲状态")
+        self.status_pill = QLabel("● 待命中")
         self.status_pill.setProperty("class", "status-pill")
         self.status_pill.setProperty("state", "idle")
         self.status_pill.setStyle(self.style())  # 刷新属性
@@ -1168,7 +1204,7 @@ class MainWindow(QMainWindow):
         bar = QHBoxLayout()
         bar.setSpacing(10)
 
-        self.btn_toggle = QPushButton("启动定时")
+        self.btn_toggle = QPushButton("▶  启动定时")
         self.btn_toggle.setProperty("class", "btn-primary")
         self.btn_toggle.setMinimumHeight(44)
         self.btn_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1505,6 +1541,10 @@ class MainWindow(QMainWindow):
         is_single = (mode == "single")
         self.btn_seg_single.setProperty("active", is_single)
         self.btn_seg_loop.setProperty("active", not is_single)
+        # 同步 Qt 勾选态：排他按钮组下程序化切换（配置加载/热更新）不会自动勾选，
+        # 不同步会出现「视觉已切换、键盘与勾选语义仍停在旧模式」的不一致
+        self.btn_seg_single.setChecked(is_single)
+        self.btn_seg_loop.setChecked(not is_single)
         self.btn_seg_single.style().unpolish(self.btn_seg_single)
         self.btn_seg_single.style().polish(self.btn_seg_single)
         self.btn_seg_loop.style().unpolish(self.btn_seg_loop)
@@ -1524,7 +1564,12 @@ class MainWindow(QMainWindow):
             self._append_log(f"🕐 单次触发时间已设为当前时刻：{now.toString('yyyy-MM-dd HH:mm:ss')}")
         else:
             self.loop_start_dt.setDateTime(now)
-            self._append_log(f"🕐 循环开始时间已设为当前时刻：{now.toString('yyyy-MM-dd HH:mm:ss')}")
+            # 开始时间取当下后，若结束时间已不在未来则同步顺延，避免出现「开始晚于结束」的无效配置
+            if self.loop_end_dt.dateTime() <= now:
+                self.loop_end_dt.setDateTime(now.addDays(1))
+                self._append_log("🕐 循环开始时间已设为当前时刻；原结束时间不晚于开始，已自动顺延 1 天。")
+            else:
+                self._append_log(f"🕐 循环开始时间已设为当前时刻：{now.toString('yyyy-MM-dd HH:mm:ss')}")
 
     def _sync_suffix_limit(self):
         """循环模式：追加后续延时不得超过任务间隔，避免与下一次触发冲突。"""
@@ -1540,10 +1585,6 @@ class MainWindow(QMainWindow):
         if spin.value() > spin.maximum():
             spin.setValue(spin.maximum())
 
-    def _on_mode_changed(self):
-        # 初始化时根据默认选中状态设置面板可见性
-        self._set_mode("single")
-
     # ── 配置文件：持久化 + 热更新 ─────────────────────────────
 
     def _on_ui_changed_for_save(self, *_):
@@ -1552,6 +1593,13 @@ class MainWindow(QMainWindow):
             return
         # 用户在界面上真实改动过；程序回填（初始化/热更新）在 _is_loading 时已提前 return
         self._user_touched = True
+        # 运行中的任务使用启动时的配置快照，界面改动不会即时影响本次运行，首次改动时明确告知
+        if self.worker and self.worker.isRunning():
+            if not getattr(self, '_run_edit_notified', False):
+                self._run_edit_notified = True
+                self._append_log("ℹ️  任务运行中：本次改动已保存，将在下次启动定时时生效。")
+        else:
+            self._run_edit_notified = False
         self._dirty = True
         self._pending_save = True
         if not hasattr(self, '_debounce_timer'):
@@ -1716,17 +1764,52 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "导入", "文件中没有可识别的发送内容。")
             return
         self._set_prompts(prompts)
+        self._user_touched = True   # 导入是用户显式动作，须防止附属窗口关闭时被当作未使用实例清空
         self._append_log(f"📂  已导入 {len(prompts)} 条发送内容（来自 {os.path.basename(path)}）")
         self._persist()
 
     # ── 窗口列表 ─────────────────────────────────────────────
 
     def _refresh_window_list(self):
-        self.win_combo.clear()
-        for title, hwnd in list_all_windows():
-            self.win_combo.addItem(f"{title}", hwnd)
+        prev_hwnd = self.win_combo.currentData()
+        prev_title = self.win_combo.currentText()
+        was_loading = self._loading
+        # 刷新属程序化重建，不应被判定为用户改动而触发保存
+        self._loading = True
+        stale = False
+        try:
+            self.win_combo.clear()
+            for title, hwnd in list_all_windows():
+                self.win_combo.addItem(f"{title}", hwnd)
+
+            # 按 hwnd 恢复原选中目标，避免仅因刷新而丢失已配置的目标窗口
+            restore = -1
+            if prev_hwnd:
+                for i in range(self.win_combo.count()):
+                    if self.win_combo.itemData(i) == prev_hwnd:
+                        restore = i
+                        break
+            if restore < 0 and prev_title:
+                idx = self.win_combo.findText(prev_title)
+                if idx >= 0:
+                    restore = idx
+            if restore < 0 and prev_title:
+                # 目标窗口已关闭：保留原条目（句柄失效会在启动/测试时明确提示），
+                # 而不是静默改选到列表首位的其它窗口
+                self.win_combo.insertItem(0, prev_title, prev_hwnd)
+                restore = 0
+                stale = True
+            if restore >= 0:
+                self.win_combo.setCurrentIndex(restore)
+        finally:
+            self._loading = was_loading
+        if stale:
+            self._append_log(f"⚠️  原目标窗口「{prev_title}」已不存在，请重新拖拽捕获。")
 
     def _on_target_captured(self, hwnd, x, y, title):
+        if not hwnd:
+            self._append_log("⚠️  未捕获到有效窗口，请把准星拖到目标窗口内部再松开。")
+            return
         self.spin_x.setValue(x)
         self.spin_y.setValue(y)
 
@@ -1741,6 +1824,9 @@ class MainWindow(QMainWindow):
             self.win_combo.insertItem(0, title, hwnd)
             self.win_combo.setCurrentIndex(0)
 
+        # 捕获是用户显式动作：即使坐标/选中项未变化也要标记改动并持久化，
+        # 否则附属窗口关闭时会被当作「未使用实例」静默删除配置
+        self._on_ui_changed_for_save()
         self._append_log(f"🎯 已捕获目标 — 窗口：{title}，坐标：({x}, {y})")
 
     # ── 提示词卡片 ──────────────────────────────────────────
@@ -1787,6 +1873,8 @@ class MainWindow(QMainWindow):
         self.prompt_scroll.verticalScrollBar().setValue(self.prompt_scroll.verticalScrollBar().maximum())
         self._update_prompt_count()
         self._renumber_prompts()
+        # 增删卡片是用户显式动作（内容可能仍为空，不会触发 textChanged），需显式标记改动
+        self._on_ui_changed_for_save()
         return edit
 
     def _remove_prompt_card(self, edit):
@@ -1798,6 +1886,7 @@ class MainWindow(QMainWindow):
         card.deleteLater()
         self._update_prompt_count()
         self._renumber_prompts()
+        self._on_ui_changed_for_save()
 
     def _renumber_prompts(self):
         """删除后重新编号"""
@@ -1873,12 +1962,14 @@ class MainWindow(QMainWindow):
         if mode == "single":
             fire_dt = self._combine_dt(self.single_dt)
             now = datetime.datetime.now()
-            if fire_dt <= now:
+            if fire_dt < now - datetime.timedelta(seconds=PAST_TOLERANCE_SEC):
                 item = QListWidgetItem(f"⚠️  {fire_dt.strftime('%Y-%m-%d %H:%M:%S')}  （时间已过去，启动时会询问是否顺延）")
                 item.setForeground(QColor("#ffaa3d"))
                 self.list_schedule.addItem(item)
             else:
-                item = QListWidgetItem(f"🕐  {fire_dt.strftime('%Y-%m-%d %H:%M:%S')}    单次 · 仅 1 次")
+                # 落在容忍窗口内（例如刚点「获取此时」）按即将触发呈现，与启动行为一致
+                label = "即将触发" if fire_dt <= now else "单次 · 仅 1 次"
+                item = QListWidgetItem(f"🕐  {fire_dt.strftime('%Y-%m-%d %H:%M:%S')}    {label}")
                 item.setForeground(QColor("#00d4ff"))
                 self.list_schedule.addItem(item)
             return
@@ -1937,14 +2028,16 @@ class MainWindow(QMainWindow):
         if is_single:
             start_dt = self._combine_dt(self.single_dt)
             end_dt = start_dt
-            if not for_test and start_dt <= now:
+            if not for_test and start_dt < now - datetime.timedelta(seconds=PAST_TOLERANCE_SEC):
                 reply = QMessageBox.question(
                     self, "时间已过去",
-                    f"所设单次时间 {start_dt.strftime('%Y-%m-%d %H:%M:%S')} 已过去。\n是否自动顺延至明天同一时间？",
+                    f"所设单次时间 {start_dt.strftime('%Y-%m-%d %H:%M:%S')} 已过去。\n是否自动顺延至下一个同点时刻？",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                 )
                 if reply == QMessageBox.StandardButton.Yes:
-                    start_dt = start_dt + datetime.timedelta(days=1)
+                    # 原时间可能已过去多日，仅加 1 天仍可能落在过去，故顺延到第一个未来同点
+                    while start_dt <= now:
+                        start_dt = start_dt + datetime.timedelta(days=1)
                     end_dt = start_dt
                     self.single_dt.setDateTime(QDateTime(start_dt.year, start_dt.month, start_dt.day,
                                                          start_dt.hour, start_dt.minute, start_dt.second))
@@ -1962,6 +2055,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self, "配置错误",
                     "追加后续的延时时长必须小于循环发送的间隔时长，否则会与下一次触发冲突。")
+                return None
+            # 结束时间之前已无可用触发时刻时直接拦截，避免启动后立即「无任务可执行」结束
+            if not compute_fire_list('loop', start_dt, end_dt, self.spin_interval.value(),
+                                     self.chk_immediate.isChecked(), max_count=1):
+                QMessageBox.warning(
+                    self, "配置错误",
+                    "按当前开始/结束时间与间隔，结束时间之前已无可用触发时刻。\n请调整时间或间隔后重试。")
                 return None
 
         return {
@@ -1997,11 +2097,14 @@ class MainWindow(QMainWindow):
 
     def toggle_task(self):
         if self.worker and self.worker.isRunning():
-            # 停止
-            self.worker.requestInterruption()
-            while not self.worker.wait(100):
+            # 停止：用局部引用等待，避免 processEvents 期间 finished 槽把 self.worker 置空后
+            # 循环条件再访问 None 抛 AttributeError
+            worker = self.worker
+            worker.requestInterruption()
+            while not worker.wait(100):
                 QApplication.processEvents()
-            self.worker = None
+            if self.worker is worker:
+                self.worker = None
             self.next_fire_time = None
             self.btn_toggle.setText("▶  启动定时")
             self.btn_toggle.setProperty("class", "btn-primary")
@@ -2019,6 +2122,8 @@ class MainWindow(QMainWindow):
         self.worker.log_signal.connect(self._append_log)
         self.worker.status_signal.connect(self._on_worker_status)
         self.worker.next_fire_signal.connect(self._on_next_fire)
+        # 引用释放在 finished（线程真正结束）后执行，避免 run() 尚未退出时被析构
+        self.worker.finished.connect(self._on_worker_finished)
         self.worker.start()
 
         self.btn_toggle.setText("■  停止定时")
@@ -2031,13 +2136,23 @@ class MainWindow(QMainWindow):
         if status == "running":
             self._set_status("running", "● 运行中")
         elif status == "done":
+            # 只更新界面；线程对象留到 finished 再释放。
+            # run() 内 emit("done") 后线程仍在执行，此刻置空 self.worker 会让
+            # QThread 在运行中被析构（QThread: Destroyed while thread is still running）。
             self._set_status("done", "● 已完成")
             self.btn_toggle.setText("▶  启动定时")
             self.btn_toggle.setProperty("class", "btn-primary")
             self.btn_toggle.style().unpolish(self.btn_toggle)
             self.btn_toggle.style().polish(self.btn_toggle)
             self.next_fire_time = None
+
+    def _on_worker_finished(self):
+        """线程真正结束后释放引用；若期间已启动新任务则不动当前 worker。"""
+        if self.sender() is self.worker:
             self.worker = None
+            self.next_fire_time = None
+            if not self._is_loading():
+                self._refresh_schedule_preview()
 
     def _on_next_fire(self, nxt):
         self.next_fire_time = nxt
@@ -2051,12 +2166,12 @@ class MainWindow(QMainWindow):
     # ── 测试 ────────────────────────────────────────────────
 
     def test_trigger(self):
-        cfg = self._collect_config(for_test=True)
-        if not cfg:
-            return
-        # 互斥守卫：上一次测试仍在发送时拒绝再开，杜绝覆盖引用导致线程孤儿崩溃
+        # 互斥守卫前置：已有测试在发送时直接拒绝，不再走配置校验弹框
         if getattr(self, '_test_busy', False):
             self._append_log("⚠️  已有一次测试发送进行中，请稍候再试。")
+            return
+        cfg = self._collect_config(for_test=True)
+        if not cfg:
             return
         self._append_log("⚡  执行测试发送...")
         prompts = cfg['prompts']
@@ -2066,6 +2181,8 @@ class MainWindow(QMainWindow):
         self._test_busy = True
         self._test_thread = TestSendThread(cfg['hwnd'], text, cfg['click_pos'])
         self._test_thread.done_signal.connect(self._on_test_done)
+        # 线程引用同样在 finished 后释放，避免 run() 未退出时被析构
+        self._test_thread.finished.connect(self._on_test_finished)
         try:
             self._test_thread.start()
         except Exception as e:
@@ -2080,7 +2197,10 @@ class MainWindow(QMainWindow):
             self._append_log("✅  测试完成：已聚焦并发送。")
         else:
             self._append_log("❌  测试失败：请确认目标窗口权限是否高于本程序。")
-        self._test_thread = None
+
+    def _on_test_finished(self):
+        if self.sender() is getattr(self, '_test_thread', None):
+            self._test_thread = None
 
     # ── 日志 ────────────────────────────────────────────────
 
@@ -2095,9 +2215,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
-            self.worker.requestInterruption()
-            while not self.worker.wait(100):
+            worker = self.worker
+            worker.requestInterruption()
+            while not worker.wait(100):
                 QApplication.processEvents()
+            if self.worker is worker:
+                self.worker = None
         tt = getattr(self, '_test_thread', None)
         if tt and tt.isRunning():
             # 测试发送内含最长约 30s 的发送互斥等待，轮询等待其结束，避免孤儿线程残留
@@ -2208,6 +2331,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "导入失败", "无法解析配置文件：%s" % e)
             return
         self._apply_config(cfg)
+        self._user_touched = True   # 导入是用户显式动作，须防止附属窗口关闭时被当作未使用实例清空
         self._persist()
         self._append_log(f"✅ 已从 {path} 导入配置到当前窗口。")
 

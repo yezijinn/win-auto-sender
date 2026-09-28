@@ -21,6 +21,7 @@ build/
 _hot.py
 _shot.py
 _smoke.py
+_verify_ux.py
 _layout.png
 
 # 个人提示词数据文件（含发送内容，不应入库）
