@@ -35,11 +35,13 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QSpinBox, QMessageBox,
     QListWidget, QListWidgetItem, QScrollArea, QPlainTextEdit,
-    QDateTimeEdit, QCheckBox, QFrame, QSizePolicy,
-    QTextEdit, QButtonGroup, QFileDialog, QLineEdit
+    QDateTimeEdit, QCheckBox, QFrame, QSizePolicy, QSplitter,
+    QTextEdit, QButtonGroup, QFileDialog, QAbstractItemView, QLineEdit, QAbstractSpinBox
 )
-from PySide6.QtCore import Qt, QTime, QDate, QDateTime, QThread, Signal, QTimer, QSize, QFileSystemWatcher
-from PySide6.QtGui import QFont, QCursor, QPainter, QPen, QColor, QKeyEvent, QIcon, QPixmap, QBrush
+from PySide6.QtCore import (
+    Qt, QDateTime, QThread, Signal, QTimer, QFileSystemWatcher, QSettings
+)
+from PySide6.QtGui import QFont, QCursor, QPainter, QPen, QColor, QKeyEvent
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -143,6 +145,7 @@ def load_config_file(path=None):
         'strategy': 'sequence',
         'interval_min': 10,
         'run_immediately': False,
+        'lock_input': True,
         'click_x': 0,
         'click_y': 0,
         'window_title': '',
@@ -152,6 +155,10 @@ def load_config_file(path=None):
         'preface': '',
         'suffix': '',
         'suffix_delay': 0,
+        'lock_input': True,
+        'paste': True,
+        'click_steps': [],          # [{'x': int, 'y': int, 'delay_ms': int}, ...]
+        'key_steps': [],            # [{'key': 'enter', 'delay_ms': int}, ...]
         'prompts': [],
     }
     if not os.path.exists(path):
@@ -190,6 +197,42 @@ def load_config_file(path=None):
         if 'run_immediately' in g:
             val = g['run_immediately'].strip().strip('"').lower()
             cfg['run_immediately'] = val in ('true', '1', 'yes', 'on')
+        if 'lock_input' in g:
+            val = g['lock_input'].strip().strip('"').lower()
+            cfg['lock_input'] = val in ('true', '1', 'yes', 'on')
+        if 'paste' in g:
+            val = g['paste'].strip().strip('"').lower()
+            cfg['paste'] = val in ('true', '1', 'yes', 'on')
+        # 点击序列 / 按键序列：单行 JSON 数组，逐项做类型收敛，坏项直接丢弃
+        for key in ('click_steps', 'key_steps'):
+            if key not in g or not g[key].strip():
+                continue
+            try:
+                data = json.loads(g[key].strip().strip('"'))
+            except Exception:
+                continue
+            if not isinstance(data, list):
+                continue
+            steps = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    delay = max(0, min(3600000, int(float(item.get('delay_ms', 0)))))
+                except Exception:
+                    delay = 0
+                if key == 'click_steps':
+                    try:
+                        steps.append({'x': max(-32767, min(32767, int(float(item.get('x', 0))))),
+                                      'y': max(-32767, min(32767, int(float(item.get('y', 0))))),
+                                      'delay_ms': delay})
+                    except Exception:
+                        continue
+                else:
+                    name = str(item.get('key', '')).strip()
+                    if name:
+                        steps.append({'key': name, 'delay_ms': delay})
+            cfg[key] = steps
         for key in ('window_title',):
             if key in g and g[key].strip():
                 cfg[key] = g[key].strip().strip('"')
@@ -237,6 +280,10 @@ def save_config_file(cfg, path=None):
         parser['general']['strategy'] = str(gen.get('strategy', 'sequence'))
         parser['general']['interval_min'] = str(gen.get('interval_min', 10))
         parser['general']['run_immediately'] = str(bool(gen.get('run_immediately', False))).lower()
+        parser['general']['lock_input'] = str(bool(gen.get('lock_input', True))).lower()
+        parser['general']['paste'] = str(bool(gen.get('paste', True))).lower()
+        parser['general']['click_steps'] = json.dumps(gen.get('click_steps') or [], ensure_ascii=False)
+        parser['general']['key_steps'] = json.dumps(gen.get('key_steps') or [], ensure_ascii=False)
         parser['general']['click_x'] = str(gen.get('click_x', 0))
         parser['general']['click_y'] = str(gen.get('click_y', 0))
         parser['general']['window_title'] = str(gen.get('window_title', ''))
@@ -324,13 +371,129 @@ def force_foreground_window(hwnd):
 _SEND_MUTEX = win32event.CreateMutex(None, False, "Local\\WindowsLoopSend_SendMutex")
 
 
-def click_and_paste_send(hwnd, text, click_pos=None):
-    """点击 → 剪贴板粘贴 → 回车。
-    发送动作前先全屏锁定鼠标/键盘输入（提前1秒），发送完成后自动解锁。
+# 按键名 → 虚拟键码。除英文名外兼容少量中文写法（回车 / 空格 / 上 等）
+VK_NAME_MAP = {
+    'enter': 0x0D, 'return': 0x0D, '回车': 0x0D,
+    'tab': 0x09, '制表': 0x09,
+    'esc': 0x1B, 'escape': 0x1B,
+    'space': 0x20, 'spacebar': 0x20, '空格': 0x20,
+    'backspace': 0x08, '退格': 0x08,
+    'delete': 0x2E, 'del': 0x2E, '删除': 0x2E,
+    'insert': 0x2D, 'ins': 0x2D,
+    'home': 0x24, 'end': 0x23,
+    'pageup': 0x21, 'pgup': 0x21, 'pagedown': 0x22, 'pgdn': 0x22,
+    'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27,
+    '上': 0x26, '下': 0x28, '左': 0x25, '右': 0x27,
+    'ctrl': 0x11, 'control': 0x11, 'shift': 0x10, 'alt': 0x12,
+    'win': 0x5B, 'lwin': 0x5B, 'rwin': 0x5C, 'apps': 0x5D,
+    'capslock': 0x14, 'numlock': 0x90, 'scrolllock': 0x91,
+    'printscreen': 0x2C, 'pause': 0x13,
+    'minus': 0xBD, '-': 0xBD, 'equal': 0xBB, '=': 0xBB,
+    'comma': 0xBC, ',': 0xBC, 'period': 0xBE, '.': 0xBE,
+    'slash': 0xBF, '/': 0xBF, 'backslash': 0xDC, '\\': 0xDC,
+    'semicolon': 0xBA, ';': 0xBA, 'quote': 0xDE, "'": 0xDE,
+    'bracketleft': 0xDB, '[': 0xDB, 'bracketright': 0xDD, ']': 0xDD,
+    'grave': 0xC0, '`': 0xC0,
+}
+for _n in range(1, 25):
+    VK_NAME_MAP['f%d' % _n] = 0x6F + _n        # VK_F1 = 0x70
+
+
+def parse_key_combo(text):
+    """把 'enter' / 'Ctrl+A' / 'F5' 解析为虚拟键码列表；无法识别返回 None。"""
+    parts = [p.strip() for p in str(text).replace('＋', '+').split('+') if p.strip()]
+    if not parts:
+        return None
+    vks = []
+    for p in parts:
+        low = p.lower()
+        if low in VK_NAME_MAP:
+            vks.append(VK_NAME_MAP[low])
+        elif len(p) == 1 and p.isascii() and p.isalnum():
+            vks.append(ord(p.upper()))
+        else:
+            return None
+    return vks
+
+
+def press_key_combo(text):
+    """按下并释放一个按键组合（多个键用 + 连接表示同时按下）。"""
+    vks = parse_key_combo(text)
+    if not vks:
+        return False
+    try:
+        for vk in vks:
+            win32api.keybd_event(vk, 0, 0, 0)
+            time.sleep(0.02)
+        for vk in reversed(vks):
+            win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.02)
+        return True
+    except Exception as e:
+        print(f"按键失败 {text!r}：{e}")
+        return False
+
+
+def wait_interruptible(seconds, should_stop=None):
+    """可被打断的等待，返回 False 表示等待期间收到停止请求。"""
+    remaining = float(seconds)
+    while remaining > 0:
+        if should_stop is not None and should_stop():
+            return False
+        time.sleep(min(0.05, remaining))
+        remaining -= 0.05
+    return True
+
+
+def run_click_steps(steps, should_stop=None):
+    """按顺序点击各坐标点，每一步先等待自身的间隔；返回 (已完成步数, 是否被打断)。"""
+    done = 0
+    for step in steps or []:
+        # 间隔为 0 时也要先看一次停止请求，避免停不下来时仍多执行一步
+        if should_stop is not None and should_stop():
+            return done, True
+        if not wait_interruptible(float(step.get('delay_ms', 0)) / 1000.0, should_stop):
+            return done, True
+        try:
+            user32.SetCursorPos(int(step.get('x', 0)), int(step.get('y', 0)))
+            time.sleep(0.03)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            time.sleep(0.03)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        except Exception as e:
+            print(f"点击失败 {step!r}：{e}")
+            return done, False
+        done += 1
+    return done, False
+
+
+def run_key_steps(steps, should_stop=None):
+    """按顺序发送按键，每一步先等待自身的间隔；返回 (已完成步数, 失败按键, 是否被打断)。"""
+    done = 0
+    for step in steps or []:
+        if should_stop is not None and should_stop():
+            return done, None, True
+        if not wait_interruptible(float(step.get('delay_ms', 0)) / 1000.0, should_stop):
+            return done, None, True
+        name = str(step.get('key', '')).strip()
+        if not name:
+            continue
+        if not press_key_combo(name):
+            return done, name, False
+        done += 1
+    return done, None, False
+
+
+def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
+                         paste=True, lock_input=True, should_stop=None):
+    """聚焦目标窗口 → 按序列点击 → 粘贴内容 → 按序列发送按键。
+
+    click_steps / key_steps 为步骤列表，每一步自带「执行前等待」的毫秒间隔；
+    传空列表表示跳过该阶段。lock_input 为真时发送前锁定真实鼠标键盘约 1 秒，
     BlockInput 模拟输入不受影响；需管理员权限，否则静默跳过锁定。
 
-    多实例冲突规避：以进程级命名互斥锁保护整个发送关键段（复制剪贴板 +
-    点击 + 粘贴 + 回车）。同一时刻只允许一个实例执行为止，其余实例排队，
+    多实例冲突规避：以进程级命名互斥锁保护整个发送关键段（点击 + 剪贴板 +
+    粘贴 + 按键）。同一时刻只允许一个实例执行，其余实例排队，
     等待超时(30s)则返回失败、不发送，彻底规避并发剪贴板/焦点/输入竞争。
     """
     owned = False
@@ -349,9 +512,9 @@ def click_and_paste_send(hwnd, text, click_pos=None):
         return False
     blocked = False
     try:
-        # 提前1秒锁定真实鼠标键盘输入（未提权成功则 blocked 保持 False，正常发送）
+        # 启用时提前1秒锁定真实鼠标键盘输入（未提权成功则 blocked 保持 False，正常发送）
         try:
-            if user32.BlockInput(True):
+            if lock_input and user32.BlockInput(True):
                 blocked = True
         except Exception:
             pass
@@ -360,25 +523,39 @@ def click_and_paste_send(hwnd, text, click_pos=None):
 
         if not force_foreground_window(hwnd):
             return False
-        if click_pos and click_pos[0] > 0 and click_pos[1] > 0:
-            x, y = click_pos
-            user32.SetCursorPos(x, y)
+
+        # 点击序列：按配置顺序逐个点击，每步按自身间隔等待
+        steps = list(click_steps or [])
+        if steps:
+            done, interrupted = run_click_steps(steps, should_stop)
+            if interrupted:
+                print("发送中止：收到停止请求。")
+                return False
+            if done < len(steps):
+                print("发送失败：点击序列未执行完。")
+                return False
+            time.sleep(0.2)        # 点击落定后再粘贴
+
+        if paste:
+            pyperclip.copy(text)
             time.sleep(0.05)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+            win32api.keybd_event(ord('V'), 0, 0, 0)
             time.sleep(0.05)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-            time.sleep(0.2)
-        pyperclip.copy(text)
-        time.sleep(0.05)
-        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
-        win32api.keybd_event(ord('V'), 0, 0, 0)
-        time.sleep(0.05)
-        win32api.keybd_event(ord('V'), 0, win32con.KEYEVENTF_KEYUP, 0)
-        win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-        time.sleep(0.15)
-        win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
-        time.sleep(0.05)
-        win32api.keybd_event(win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32api.keybd_event(ord('V'), 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.15)
+
+        # 按键序列：默认一条回车，可换成任意按键组合
+        key_list = list(key_steps or [])
+        if key_list:
+            done, failed, interrupted = run_key_steps(key_list, should_stop)
+            if interrupted:
+                print("发送中止：收到停止请求。")
+                return False
+            if failed is not None:
+                print(f"发送失败：无法识别的按键 {failed!r}。")
+                return False
         return True
     except Exception as e:
         print(f"发送异常: {e}")
@@ -691,30 +868,6 @@ QPushButton[class="btn-secondary"]:pressed {
     background-color: #0f1e3a;
 }
 
-QPushButton[class="btn-ghost"] {
-    background-color: transparent;
-    color: #00d4ff;
-    border: 1px solid #00b8ff;
-    border-radius: 6px;
-    padding: 6px 14px;
-    font-weight: 500;
-}
-QPushButton[class="btn-ghost"]:hover {
-    background-color: rgba(0, 184, 255, 0.15);
-}
-
-QPushButton[class="btn-icon-del"] {
-    background-color: #2a1a2e;
-    color: #ff6b8a;
-    border: 1px solid #4a2538;
-    border-radius: 4px;
-    font-weight: bold;
-}
-QPushButton[class="btn-icon-del"]:hover {
-    background-color: #3d1f2b;
-    border-color: #ff6b8a;
-}
-
 /* ===== 列表 ===== */
 QListWidget {
     background-color: #0e1c33;
@@ -782,18 +935,6 @@ QLabel[class="status-pill"][state="done"] {
     color: #5ad4ff;
 }
 
-/* ===== 倒计时 ===== */
-QLabel[class="countdown"] {
-    font-size: 18pt;
-    font-weight: 700;
-    color: #00d4ff;
-    font-family: "Consolas", "Courier New", monospace;
-}
-QLabel[class="countdown-label"] {
-    font-size: 9pt;
-    color: #7a93c0;
-}
-
 /* ===== 日志 ===== */
 QTextEdit[class="log-view"] {
     background-color: #06101e;
@@ -804,12 +945,161 @@ QTextEdit[class="log-view"] {
     font-size: 9pt;
 }
 
-/* ===== 标题文字 ===== */
-QLabel#header-title {
-    font-size: 15pt;
+/* ===== 工具栏 / 操作栏 ===== */
+QFrame[class="toolbar"], QFrame[class="actionbar"] {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #101f38, stop:1 #0d1a30);
+    border: 1px solid #1f3560;
+    border-radius: 10px;
+}
+
+QLabel[class="app-title"] {
+    font-size: 13pt;
     font-weight: 700;
     color: #ffffff;
 }
+
+QLabel[class="meta"] {
+    color: #7a93c0;
+    font-size: 9.5pt;
+}
+
+QLabel[class="hint"] {
+    color: #5f739a;
+    font-size: 8.5pt;
+}
+
+/* 倒计时胶囊 */
+QLabel[class="chip"] {
+    background-color: #0e1c33;
+    border: 1px solid #1f3560;
+    border-radius: 11px;
+    padding: 2px 12px;
+    color: #00d4ff;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 11pt;
+    font-weight: 700;
+}
+
+/* 迷你按钮（工具栏 / 内容工具条） */
+QPushButton[class="btn-mini"] {
+    background-color: #132547;
+    color: #9cc0ff;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 500;
+}
+QPushButton[class="btn-mini"]:hover {
+    background-color: #1a3260;
+    border-color: #3d5d94;
+    color: #c2dbff;
+}
+QPushButton[class="btn-mini"]:pressed {
+    background-color: #0f1e3a;
+}
+
+/* ===== 步骤序列（点击序列 / 按键序列） ===== */
+QLabel[class="step-title"] {
+    color: #9fb7e6;
+    font-size: 9.5pt;
+    font-weight: 700;
+}
+QFrame[class="step-row"] {
+    background-color: #0e1c33;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+}
+QPushButton[class="btn-step"] {
+    background-color: #132547;
+    color: #9cc0ff;
+    border: 1px solid #1f3560;
+    border-radius: 4px;
+    font-weight: 600;
+    padding: 0;
+}
+QPushButton[class="btn-step"]:hover {
+    background-color: #1a3260;
+    border-color: #3d5d94;
+}
+QPushButton[class="btn-step-del"] {
+    background-color: #2a1a2e;
+    color: #ff8aa3;
+    border: 1px solid #4a2538;
+    border-radius: 4px;
+    font-weight: 600;
+    padding: 0;
+}
+QPushButton[class="btn-step-del"]:hover {
+    background-color: #3d1f2b;
+    border-color: #ff6b8a;
+}
+QLineEdit {
+    background-color: #122647;
+    border: 1px solid #1f3560;
+    border-radius: 4px;
+    padding: 3px 6px;
+    color: #d6e4ff;
+}
+QLineEdit:focus {
+    border-color: #00d4ff;
+    background-color: #16305a;
+}
+
+/* 折叠区标题 */
+QPushButton[class="collapsible"] {
+    background: transparent;
+    border: none;
+    color: #9cc0ff;
+    font-size: 9.5pt;
+    font-weight: 700;
+    padding: 2px 0;
+    text-align: left;
+}
+QPushButton[class="collapsible"]:hover {
+    color: #00d4ff;
+}
+
+QFrame[class="section"] {
+    background: transparent;
+    border: none;
+}
+
+/* 日志面板 */
+QFrame[class="log-panel"] {
+    background-color: #0a1628;
+    border: 1px solid #1f3560;
+    border-radius: 10px;
+}
+
+/* ===== 内容列表 ===== */
+QListWidget[class="prompt-list"] {
+    background-color: #0e1c33;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+    padding: 2px;
+    outline: 0;
+}
+QListWidget[class="prompt-list"]::item {
+    padding: 6px 8px;
+    border-radius: 4px;
+    margin: 1px 0;
+}
+
+/* ===== 分栏手柄 ===== */
+QSplitter::handle {
+    background: transparent;
+}
+QSplitter::handle:hover {
+    background: #1f3560;
+}
+QSplitter::handle:horizontal {
+    width: 6px;
+}
+QSplitter::handle:vertical {
+    height: 6px;
+}
+
 """
 
 
@@ -823,7 +1113,7 @@ class TargetPickerLabel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setProperty("class", "picker-box")
-        self.setFixedSize(140, 90)
+        self.setFixedSize(128, 84)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dragging = False
 
@@ -833,21 +1123,21 @@ class TargetPickerLabel(QFrame):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         # 准星
-        cx, cy = self.width() // 2, 34
+        cx, cy = self.width() // 2, 30
         pen = QPen(QColor("#00d4ff"), 2)
         painter.setPen(pen)
-        r = 14
+        r = 12
         painter.drawEllipse(cx - r, cy - r, r * 2, r * 2)
-        painter.drawLine(cx - r - 6, cy, cx + r + 6, cy)
-        painter.drawLine(cx, cy - r - 6, cx, cy + r + 6)
+        painter.drawLine(cx - r - 5, cy, cx + r + 5, cy)
+        painter.drawLine(cx, cy - r - 5, cx, cy + r + 5)
 
         # 文字
         painter.setPen(QColor("#00d4ff"))
         font = painter.font()
-        font.setPointSize(8)
+        font.setPointSize(7)
         font.setBold(True)
         painter.setFont(font)
-        painter.drawText(self.rect().adjusted(0, 55, 0, -8), Qt.AlignmentFlag.AlignCenter, "按住拖向目标窗口")
+        painter.drawText(self.rect().adjusted(0, 50, 0, -6), Qt.AlignmentFlag.AlignCenter, "按住拖向目标窗口")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -889,15 +1179,19 @@ class TestSendThread(QThread):
     """「立即测试」发送在后台线程执行，避免占用 GUI 主线程导致界面冻结。"""
     done_signal = Signal(bool)
 
-    def __init__(self, hwnd, text, click_pos, parent=None):
+    def __init__(self, hwnd, text, click_steps, key_steps, paste=True, lock_input=True, parent=None):
         super().__init__(parent)
         self.hwnd = hwnd
         self.text = text
-        self.click_pos = click_pos
+        self.click_steps = click_steps
+        self.key_steps = key_steps
+        self.paste = paste
+        self.lock_input = lock_input
 
     def run(self):
         try:
-            ok = click_and_paste_send(self.hwnd, self.text, self.click_pos)
+            ok = click_and_paste_send(self.hwnd, self.text, self.click_steps, self.key_steps,
+                                      self.paste, self.lock_input)
         except Exception:
             ok = False
         self.done_signal.emit(ok)
@@ -916,6 +1210,10 @@ class SchedulerWorker(QThread):
         self.preface = config.get('preface', '')
         self.suffix = config.get('suffix', '')
         self.suffix_delay = int(config.get('suffix_delay', 0))
+        self.lock_input = bool(config.get('lock_input', True))
+        self.paste = bool(config.get('paste', True))
+        self.click_steps = list(config.get('click_steps') or [])
+        self.key_steps = list(config.get('key_steps') or [])
         self.prompt_index = 0
 
     def pick_prompt(self):
@@ -939,7 +1237,6 @@ class SchedulerWorker(QThread):
 
     def run(self):
         hwnd = self.config['hwnd']
-        click_pos = self.config['click_pos']
         mode = self.config['mode']
         start_dt = self.config['start_dt']
         end_dt = self.config['end_dt']
@@ -976,7 +1273,9 @@ class SchedulerWorker(QThread):
             now = datetime.datetime.now()
             if now >= next_fire:
                 self.log_signal.emit("⏰ 触发 — 正在聚焦并发送...")
-                ok = click_and_paste_send(hwnd, compose_send_text(self.preface, self.pick_prompt()), click_pos)
+                ok = click_and_paste_send(hwnd, compose_send_text(self.preface, self.pick_prompt()),
+                                          self.click_steps, self.key_steps, self.paste,
+                                          self.lock_input, self.isInterruptionRequested)
                 self.log_signal.emit("✅ 发送成功。" if ok else "❌ 发送失败。")
 
                 # 追加后续：延时指定时长后再发送
@@ -987,7 +1286,8 @@ class SchedulerWorker(QThread):
                         time.sleep(min(0.2, remaining))
                         remaining -= 0.2
                     if not self.isInterruptionRequested():
-                        ok2 = click_and_paste_send(hwnd, self.suffix, click_pos)
+                        ok2 = click_and_paste_send(hwnd, self.suffix, self.click_steps, self.key_steps,
+                                                   self.paste, self.lock_input, self.isInterruptionRequested)
                         self.log_signal.emit("✅ 追加后续已发送。" if ok2 else "❌ 追加后续发送失败。")
 
                 # 以实际完成时刻作为下一调度基线：若主发送+追加后续耗时较长，
@@ -1024,12 +1324,14 @@ class MainWindow(QMainWindow):
         if is_admin():
             title += "  ·  管理员模式"
         self.setWindowTitle(title)
-        # 固定窗口：无拖动条，12:9 固定尺寸
-        self.setFixedSize(1200, 900)
+        # 可缩放窗口：默认 1180x780，最小 1040x640（分栏/日志区可拖拽调整）
+        self.setMinimumSize(1040, 640)
+        self.resize(1180, 780)
 
         self.worker = None
-        self.prompt_cards = []
         self.next_fire_time = None  # 用于倒计时显示
+        self._prompt_loading = False   # 内容编辑区程序化回填时抑制 textChanged 回写
+        self._log_visible = True       # 日志面板展开状态
         self._config_file = default_config_file(instance_name)
         self._loading = True     # 初始化期间抑制自动保存
         self._initializing = True  # 覆盖整个构造期（_set_mode 会再触发保存）
@@ -1057,6 +1359,9 @@ class MainWindow(QMainWindow):
         self._pending_save = False
         if hasattr(self, '_debounce_timer'):
             self._debounce_timer.stop()
+
+        # 恢复上次的窗口尺寸与分栏比例（不影响 ini 配置内容）
+        self._restore_ui_state()
 
         # 每秒刷新：当前时间 + 倒计时 +（非运行时）预览
         self._timer = QTimer(self)
@@ -1110,132 +1415,323 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(8)
 
-        # ─── 顶部状态栏 ───
-        header = QHBoxLayout()
-        header.setSpacing(10)
+        # ─── 顶部工具栏：身份 / 状态 / 时间 / 倒计时 / 配置操作 ───
+        root.addWidget(self._build_toolbar())
+
+        # ─── 主体：左右分栏（可拖拽）＋ 底部日志（可折叠） ───
+        self.split_v = QSplitter(Qt.Orientation.Vertical)
+        self.split_v.setChildrenCollapsible(False)
+        self.split_v.setHandleWidth(6)
+
+        self.split_h = QSplitter(Qt.Orientation.Horizontal)
+        self.split_h.setChildrenCollapsible(False)
+        self.split_h.setHandleWidth(6)
+        self.split_h.addWidget(self._build_settings_panel())
+        self.split_h.addWidget(self._build_content_panel())
+        self.split_h.setStretchFactor(0, 0)
+        self.split_h.setStretchFactor(1, 1)
+        self.split_h.setSizes([450, 700])
+
+        self.split_v.addWidget(self.split_h)
+        self.split_v.addWidget(self._build_log_panel())
+        self.split_v.setStretchFactor(0, 1)
+        self.split_v.setStretchFactor(1, 0)
+        self.split_v.setSizes([650, 130])
+
+        root.addWidget(self.split_v, 1)
+
+        # ─── 底部操作栏 ───
+        root.addWidget(self._build_action_bar())
+
+    # ── 工具栏 / 面板构建 ────────────────────────────────────
+
+    def _build_toolbar(self):
+        bar = QFrame()
+        bar.setProperty("class", "toolbar")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(12, 8, 12, 8)
+        h.setSpacing(10)
+
         title_lbl = QLabel("⏱️  定时发送")
-        title_lbl.setStyleSheet("font-size: 15pt; font-weight: 700; color: #ffffff;")
-        header.addWidget(title_lbl)
-        header.addSpacing(12)
-
-        btn_save_cfg = QPushButton("💾 保存配置")
-        btn_save_cfg.setProperty("class", "btn-ghost")
-        btn_save_cfg.setMinimumHeight(26)
-        btn_save_cfg.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_save_cfg.setToolTip("立即把当前配置写入本地配置文件")
-        btn_save_cfg.clicked.connect(self._save_config_now)
-        header.addWidget(btn_save_cfg)
-
-        btn_import_cfg = QPushButton("📥 导入配置")
-        btn_import_cfg.setProperty("class", "btn-ghost")
-        btn_import_cfg.setMinimumHeight(26)
-        btn_import_cfg.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_import_cfg.setToolTip("从本地 ini 文件导入配置到当前窗口")
-        btn_import_cfg.clicked.connect(self._import_config_file)
-        header.addWidget(btn_import_cfg)
-
-        btn_reset_cfg = QPushButton("♻️ 恢复出厂")
-        btn_reset_cfg.setProperty("class", "btn-ghost")
-        btn_reset_cfg.setMinimumHeight(26)
-        btn_reset_cfg.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_reset_cfg.setToolTip("将当前窗口配置恢复为出厂默认（发送内容等全部清空）")
-        btn_reset_cfg.clicked.connect(self._reset_factory_config)
-        header.addWidget(btn_reset_cfg)
-
-        header.addStretch()
-
-        self.lbl_now = QLabel()
-        self.lbl_now.setStyleSheet("color: #7a93c0; font-size: 9.5pt;")
-        header.addWidget(self.lbl_now)
+        title_lbl.setProperty("class", "app-title")
+        h.addWidget(title_lbl)
 
         self.status_pill = QLabel("● 待命中")
         self.status_pill.setProperty("class", "status-pill")
         self.status_pill.setProperty("state", "idle")
-        self.status_pill.setStyle(self.style())  # 刷新属性
-        header.addWidget(self.status_pill)
+        h.addWidget(self.status_pill)
 
-        root.addLayout(header)
+        h.addSpacing(6)
+        self.lbl_now = QLabel()
+        self.lbl_now.setProperty("class", "meta")
+        h.addWidget(self.lbl_now)
 
-        # ─── 主体：左右两列（固定窗口，无窗口级滚动条） ───
-        body = QHBoxLayout()
-        body.setContentsMargins(0, 2, 0, 4)
-        body.setSpacing(12)
+        h.addSpacing(6)
+        self.lbl_countdown = QLabel("--:--:--")
+        self.lbl_countdown.setProperty("class", "chip")
+        h.addWidget(self.lbl_countdown)
 
-        # === 左列：目标窗口15% / 发送计划55% / 距下次触发15% / 运行日志15% ===
-        left = QVBoxLayout()
-        left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(10)
+        self.lbl_countdown_label = QLabel("待命中 · 配置好后点「启动定时」")
+        self.lbl_countdown_label.setProperty("class", "meta")
+        h.addWidget(self.lbl_countdown_label)
+
+        h.addStretch()
+
+        for text, tip, slot in (
+            ("💾 保存配置", "立即把当前配置写入本地配置文件", self._save_config_now),
+            ("📥 导入配置", "从本地 ini 文件导入配置到当前窗口", self._import_config_file),
+            ("♻️ 恢复出厂", "将当前窗口配置恢复为出厂默认（发送内容等全部清空）", self._reset_factory_config),
+            ("🆕 新建窗口", "新开一个独立实例，用于管理另一个目标窗口", self._new_window),
+        ):
+            btn = QPushButton(text)
+            btn.setProperty("class", "btn-mini")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            h.addWidget(btn)
+        return bar
+
+    def _build_settings_panel(self):
+        """左栏：目标窗口 → 触发计划 → 发送行为，纵向可滚动，宽度可拖拽。"""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(430)
+
+        inner = QWidget()
+        col = QVBoxLayout(inner)
+        col.setContentsMargins(0, 0, 6, 0)
+        col.setSpacing(10)
 
         target_card, target_layout, _ = self._card("目标窗口", "🎯")
         self._build_target_card(target_layout)
-        left.addWidget(target_card, 3)
+        col.addWidget(target_card)
 
-        sched_card, sched_layout, _ = self._card("")          # 发送计划（无大标题）
+        sched_card, sched_layout, _ = self._card("触发计划", "⏰")
         self._build_schedule_card(sched_layout)
-        left.addWidget(sched_card, 11)
+        col.addWidget(sched_card, 1)
 
-        cd_card, cd_layout, _ = self._card("")                # 距下次触发（无大标题）
-        self._build_countdown_card(cd_layout)
-        left.addWidget(cd_card, 3)
+        behavior_card, behavior_layout, _ = self._card("发送行为", "⚙️")
+        self._build_behavior_card(behavior_layout)
+        col.addWidget(behavior_card)
 
-        log_card, log_layout, _ = self._card("")              # 运行日志（无大标题）
-        self._build_log_card(log_layout)
-        left.addWidget(log_card, 3)
+        scroll.setWidget(inner)
+        return scroll
 
-        body.addLayout(left, 11)
+    def _build_behavior_card(self, layout):
+        self.chk_paste = QCheckBox("粘贴发送内容（Ctrl+V）")
+        self.chk_paste.setChecked(True)
+        self.chk_paste.setToolTip("关闭后不粘贴内容，只按下面的按键序列发送按键")
+        self.chk_paste.toggled.connect(self._on_ui_changed_for_save)
+        layout.addWidget(self.chk_paste)
 
-        # === 右列：发送内容占满整列高度 ===
-        right = QVBoxLayout()
-        right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(0)
+        self.chk_lock_input = QCheckBox("发送前锁定鼠标键盘约 1 秒（避免与手动操作冲突）")
+        self.chk_lock_input.setChecked(True)
+        self.chk_lock_input.setToolTip("需管理员权限；未提权时自动跳过，不影响正常发送")
+        self.chk_lock_input.toggled.connect(self._on_ui_changed_for_save)
+        layout.addWidget(self.chk_lock_input)
 
-        content_card, content_layout, _ = self._card("发送内容", "📝")
-        self._build_content_card(content_layout)
-        right.addWidget(content_card, 12)
+        # 按键序列：粘贴完成后依次发送
+        key_head = QHBoxLayout()
+        key_head.setSpacing(5)
+        key_title = QLabel("按键序列（粘贴后依次发送）")
+        key_title.setProperty("class", "step-title")
+        key_head.addWidget(key_title)
+        key_head.addStretch()
 
-        body.addLayout(right, 12)
+        btn_add_key = QPushButton("＋ 添加")
+        btn_add_key.setProperty("class", "btn-mini")
+        btn_add_key.setToolTip("新增一个按键步骤，可填 Enter / Tab / Ctrl+A / F5 等")
+        btn_add_key.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_add_key.clicked.connect(lambda: self._add_key_step())
+        key_head.addWidget(btn_add_key)
 
-        root.addLayout(body, 1)
+        btn_clear_key = QPushButton("清空")
+        btn_clear_key.setProperty("class", "btn-mini")
+        btn_clear_key.setToolTip("清空全部按键：粘贴后不额外按键")
+        btn_clear_key.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clear_key.clicked.connect(self._clear_key_steps)
+        key_head.addWidget(btn_clear_key)
+        layout.addLayout(key_head)
 
-        # ─── 底部操作栏（固定在窗口底部，不进滚动区） ───
-        bar = QHBoxLayout()
-        bar.setSpacing(10)
+        self.key_steps_layout = QVBoxLayout()
+        self.key_steps_layout.setContentsMargins(0, 0, 0, 0)
+        self.key_steps_layout.setSpacing(4)
+        key_box = QWidget()
+        key_box.setLayout(self.key_steps_layout)
+        layout.addWidget(key_box)
+
+        self.lbl_key_empty = QLabel("未设置按键：粘贴后不额外按键")
+        self.lbl_key_empty.setProperty("class", "hint")
+        layout.addWidget(self.lbl_key_empty)
+        self.key_steps = []
+        self._add_key_step('enter', 0)          # 默认回车，与旧版行为一致
+
+        tip = QLabel("目标窗口若以管理员身份运行，本程序也需以管理员运行，否则键鼠消息会被系统拦截。")
+        tip.setProperty("class", "hint")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+    def _build_action_bar(self):
+        bar = QFrame()
+        bar.setProperty("class", "actionbar")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(12, 8, 12, 8)
+        h.setSpacing(10)
 
         self.btn_toggle = QPushButton("▶  启动定时")
         self.btn_toggle.setProperty("class", "btn-primary")
-        self.btn_toggle.setMinimumHeight(44)
+        self.btn_toggle.setMinimumHeight(42)
         self.btn_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_toggle.clicked.connect(self.toggle_task)
-        bar.addWidget(self.btn_toggle, 2)
+        h.addWidget(self.btn_toggle, 2)
 
-        btn_test = QPushButton("立即测试")
+        btn_test = QPushButton("⚡  立即测试发送")
         btn_test.setProperty("class", "btn-secondary")
-        btn_test.setMinimumHeight(44)
+        btn_test.setMinimumHeight(42)
         btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_test.clicked.connect(self.test_trigger)
-        bar.addWidget(btn_test, 1)
+        h.addWidget(btn_test, 1)
 
-        btn_refresh = QPushButton("刷新预览")
-        btn_refresh.setProperty("class", "btn-secondary")
-        btn_refresh.setMinimumHeight(44)
-        btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_refresh.clicked.connect(self._refresh_schedule_preview)
-        bar.addWidget(btn_refresh, 1)
+        h.addStretch()
 
-        btn_new = QPushButton("新建窗口 用于新目标")
-        btn_new.setProperty("class", "btn-ghost")
-        btn_new.setMinimumHeight(44)
-        btn_new.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_new.clicked.connect(self._new_window)
-        bar.addWidget(btn_new, 1)
+        self.lbl_save_state = QLabel("")
+        self.lbl_save_state.setProperty("class", "meta")
+        h.addWidget(self.lbl_save_state)
+        return bar
 
-        root.addLayout(bar)
+    def _build_log_panel(self):
+        panel = QFrame()
+        panel.setProperty("class", "log-panel")
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(10, 6, 10, 8)
+        v.setSpacing(4)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.btn_log_toggle = QPushButton("▾  运行日志")
+        self.btn_log_toggle.setProperty("class", "collapsible")
+        self.btn_log_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_log_toggle.setToolTip("展开 / 收起运行日志")
+        self.btn_log_toggle.clicked.connect(self._toggle_log)
+        row.addWidget(self.btn_log_toggle)
+        row.addStretch()
+
+        btn_clear = QPushButton("清空日志")
+        btn_clear.setProperty("class", "btn-mini")
+        btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clear.clicked.connect(lambda: self.log_view.clear())
+        row.addWidget(btn_clear)
+        v.addLayout(row)
+
+        self.log_view = QTextEdit()
+        self.log_view.setProperty("class", "log-view")
+        self.log_view.setReadOnly(True)
+        self.log_view.setMinimumHeight(48)
+        v.addWidget(self.log_view, 1)
+        return panel
+
+    def _toggle_log(self):
+        self._log_visible = not self._log_visible
+        self.log_view.setVisible(self._log_visible)
+        self.btn_log_toggle.setText(("▾  " if self._log_visible else "▸  ") + "运行日志")
+        sizes = self.split_v.sizes()
+        if self._log_visible:
+            self.split_v.setSizes([max(360, sum(sizes) - 130), 130])
+        else:
+            self.split_v.setSizes([max(400, sum(sizes) - 34), 34])
+
+    def _collapsible_section(self, title, tip):
+        """可折叠区块：返回 (容器, 内容布局, 标题按钮, 内容控件)。"""
+        box = QFrame()
+        box.setProperty("class", "section")
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 2, 0, 0)
+        v.setSpacing(6)
+
+        head_row = QHBoxLayout()
+        head_row.setSpacing(8)
+        head = QPushButton("▸  " + title)
+        head.setProperty("class", "collapsible")
+        head.setCursor(Qt.CursorShape.PointingHandCursor)
+        head.setCheckable(True)
+        head_row.addWidget(head)
+
+        tip_lbl = QLabel(tip)
+        tip_lbl.setProperty("class", "hint")
+        head_row.addWidget(tip_lbl)
+        head_row.addStretch()
+        v.addLayout(head_row)
+
+        body_w = QWidget()
+        body = QVBoxLayout(body_w)
+        body.setContentsMargins(2, 0, 2, 0)
+        body.setSpacing(6)
+        body_w.setVisible(False)
+        v.addWidget(body_w)
+
+        head.toggled.connect(lambda on: self._toggle_section(head, body_w, title, on))
+        return box, body, head, body_w
+
+    @staticmethod
+    def _toggle_section(head, body_w, title, on):
+        head.setText(("▾  " if on else "▸  ") + title)
+        body_w.setVisible(on)
+
+    def _sync_optional_sections(self):
+        """附加前言 / 追加后续若有内容则自动展开，避免内容被折叠隐藏。"""
+        if self.preface_edit.toPlainText().strip():
+            self._preface_head.setChecked(True)
+        if self.suffix_edit.toPlainText().strip() or self.suffix_delay_spin.value() > 0:
+            self._suffix_head.setChecked(True)
+
+    # ── 窗口几何 / 分栏状态（存 QSettings，不污染 ini 配置） ──
+
+    def _ui_settings(self):
+        key = 'WindowsLoopSend' + ('-' + self.instance_name if self.instance_name else '')
+        return QSettings('yezijinn', key)
+
+    def _restore_ui_state(self):
+        try:
+            s = self._ui_settings()
+            geo = s.value('geometry')
+            if geo is not None:
+                self.restoreGeometry(geo)
+            sizes_h = s.value('split_h')
+            if sizes_h and len(sizes_h) == 2:
+                self.split_h.setSizes([int(x) for x in sizes_h])
+            sizes_v = s.value('split_v')
+            if sizes_v and len(sizes_v) == 2:
+                self.split_v.setSizes([int(x) for x in sizes_v])
+            log_visible = s.value('log_visible')
+            if log_visible is not None and str(log_visible).lower() in ('false', '0'):
+                self._toggle_log()      # 上次为收起态：沿用收起外观，避免日志被压成细条
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        """窄窗口下收起工具栏文字提示，避免时钟与按钮被挤压（倒计时胶囊始终保留）。"""
+        super().resizeEvent(event)
+        hint = getattr(self, 'lbl_countdown_label', None)
+        if hint is not None:
+            hint.setVisible(self.width() >= 1100)
+
+    def _save_ui_state(self):
+        try:
+            s = self._ui_settings()
+            s.setValue('geometry', self.saveGeometry())
+            s.setValue('split_h', self.split_h.sizes())
+            s.setValue('split_v', self.split_v.sizes())
+            s.setValue('log_visible', self._log_visible)
+        except Exception:
+            pass
 
     def _build_target_card(self, layout):
-        # 拖拽 + 下拉
+        # 第一行：拖拽准星 ｜ 目标窗口选择
         row1 = QHBoxLayout()
         row1.setSpacing(10)
 
@@ -1247,78 +1743,353 @@ class MainWindow(QMainWindow):
         right_col.setSpacing(6)
 
         self.win_combo = QComboBox()
-        self.win_combo.setMinimumWidth(200)
+        self.win_combo.setMinimumWidth(120)
+        # 窗口标题可能很长：宽度按最小可见字符数而非最长条目计算，避免撑破左栏
+        self.win_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.win_combo.setMinimumContentsLength(10)
         self.win_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        btn_win_refresh = QPushButton("🔄 刷新")
+        btn_win_refresh = QPushButton("🔄")
         btn_win_refresh.setProperty("class", "btn-secondary")
+        btn_win_refresh.setFixedWidth(40)
+        btn_win_refresh.setToolTip("刷新可见窗口列表")
         btn_win_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_win_refresh.clicked.connect(self._refresh_window_list)
 
         combo_row = QHBoxLayout()
+        combo_row.setSpacing(6)
         combo_row.addWidget(self.win_combo, 1)
         combo_row.addWidget(btn_win_refresh)
         right_col.addLayout(combo_row)
         self.win_combo.currentIndexChanged.connect(self._on_ui_changed_for_save)
 
-        # 坐标
-        coord_row = QHBoxLayout()
-        self.spin_x = QSpinBox()
-        self.spin_x.setRange(0, 9999)
-        self.spin_x.setPrefix("X: ")
-        self.spin_y = QSpinBox()
-        self.spin_y.setRange(0, 9999)
-        self.spin_y.setPrefix("Y: ")
-        btn_clear_coord = QPushButton("清空坐标")
-        btn_clear_coord.setProperty("class", "btn-secondary")
-        btn_clear_coord.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_clear_coord.clicked.connect(lambda: (self.spin_x.setValue(0), self.spin_y.setValue(0)))
-        self.spin_x.valueChanged.connect(self._on_ui_changed_for_save)
-        self.spin_y.valueChanged.connect(self._on_ui_changed_for_save)
-        coord_row.addWidget(self.spin_x)
-        coord_row.addWidget(self.spin_y)
-        coord_row.addWidget(btn_clear_coord)
-        coord_row.addStretch()
-        right_col.addLayout(coord_row)
+        tip = QLabel("按住准星拖到目标输入框松开：既绑定窗口，也追加一个点击点")
+        tip.setProperty("class", "hint")
+        tip.setWordWrap(True)
+        right_col.addWidget(tip)
+        right_col.addStretch()
 
         row1.addLayout(right_col, 1)
         layout.addLayout(row1)
 
-    def _build_content_card(self, layout):
-        # 附加前言（每次发送时自动置于内容开头）
-        preface_head = QHBoxLayout()
-        title_lbl = QLabel("[附加前言]")
-        title_lbl.setStyleSheet("font-size: 9.5pt; font-weight: 700; color: #9fb7e6;")
-        preface_head.addWidget(title_lbl)
-        tip_lbl = QLabel("每一次发送时 自动将文本置于每一条发送内容的开头")
-        tip_lbl.setStyleSheet("color: #5f739a; font-size: 8.5pt;")
-        preface_head.addWidget(tip_lbl)
-        preface_head.addStretch()
-        layout.addLayout(preface_head)
+        # 第二块：点击序列（按顺序执行，每步自定义坐标与间隔）
+        seq_head = QHBoxLayout()
+        seq_head.setSpacing(5)
+        seq_title = QLabel("点击序列（自上而下依次点击）")
+        seq_title.setProperty("class", "step-title")
+        seq_head.addWidget(seq_title)
+        seq_head.addStretch()
 
+        btn_add_click = QPushButton("＋ 添加")
+        btn_add_click.setProperty("class", "btn-mini")
+        btn_add_click.setToolTip("新增一个点击点（默认取上一个点的坐标，可手动改）")
+        btn_add_click.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_add_click.clicked.connect(lambda: self._add_click_step())
+        seq_head.addWidget(btn_add_click)
+
+        btn_clear_click = QPushButton("清空")
+        btn_clear_click.setProperty("class", "btn-mini")
+        btn_clear_click.setToolTip("清空全部点击点：只聚焦目标窗口，不点击")
+        btn_clear_click.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clear_click.clicked.connect(self._clear_click_steps)
+        seq_head.addWidget(btn_clear_click)
+        layout.addLayout(seq_head)
+
+        self.click_steps_layout = QVBoxLayout()
+        self.click_steps_layout.setContentsMargins(0, 0, 0, 0)
+        self.click_steps_layout.setSpacing(4)
+        click_box = QWidget()
+        click_box.setLayout(self.click_steps_layout)
+        layout.addWidget(click_box)
+
+        self.lbl_click_empty = QLabel("未设置点击点：发送时只聚焦窗口，不点击")
+        self.lbl_click_empty.setProperty("class", "hint")
+        layout.addWidget(self.lbl_click_empty)
+        self.click_steps = []
+
+    # ── 步骤序列编辑（点击序列 / 按键序列） ──────────────────
+
+    @staticmethod
+    def _step_row():
+        """一个步骤行的容器与布局。"""
+        frame = QFrame()
+        frame.setProperty("class", "step-row")
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(6, 4, 6, 4)
+        row.setSpacing(4)
+        return frame, row
+
+    @staticmethod
+    def _step_buttons(row, entry, on_up, on_down, on_del):
+        """步骤行尾部的上移 / 下移 / 删除按钮（闭包捕获 entry 字典本体）。"""
+        for text, tip, slot, cls in (
+            ("↑", "上移（越靠前越先执行）", lambda: on_up(entry), "btn-step"),
+            ("↓", "下移（越靠后越晚执行）", lambda: on_down(entry), "btn-step"),
+            ("✕", "删除该步骤", lambda: on_del(entry), "btn-step-del"),
+        ):
+            btn = QPushButton(text)
+            btn.setProperty("class", cls)
+            btn.setFixedSize(22, 22)
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(slot)
+            row.addWidget(btn)
+
+    def _add_click_step(self, x=None, y=None, delay_ms=0, index=None):
+        """新增一个点击点。x/y 为空时沿用上一点坐标；一个都没有则取当前光标位置。"""
+        if x is None and y is None:
+            if self.click_steps:
+                x = self.click_steps[-1]['x'].value()
+                y = self.click_steps[-1]['y'].value()
+            else:
+                pt = wintypes.POINT()
+                user32.GetCursorPos(ctypes.byref(pt))
+                x, y = pt.x, pt.y
+
+        entry = {}
+        frame, row = self._step_row()
+        num = QLabel("")
+        num.setFixedWidth(16)
+        num.setProperty("class", "meta")
+        # 坐标由准星捕获或直接输入，不需要步进箭头；去掉箭头才能完整显示五位坐标
+        sp_x = QSpinBox()
+        sp_x.setRange(-32767, 32767)
+        sp_x.setPrefix("X ")
+        sp_x.setValue(int(x))
+        sp_x.setMinimumWidth(78)
+        sp_x.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        sp_y = QSpinBox()
+        sp_y.setRange(-32767, 32767)
+        sp_y.setPrefix("Y ")
+        sp_y.setValue(int(y))
+        sp_y.setMinimumWidth(78)
+        sp_y.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        sp_d = QSpinBox()
+        sp_d.setRange(0, 3600000)
+        sp_d.setSuffix(" ms")
+        sp_d.setValue(int(delay_ms))
+        sp_d.setMinimumWidth(86)
+        sp_d.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        sp_d.setToolTip("执行这个点击点之前等待的时长（毫秒）")
+
+        row.addWidget(num)
+        row.addWidget(sp_x, 1)
+        row.addWidget(sp_y, 1)
+        row.addWidget(sp_d)
+        self._step_buttons(
+            row, entry,
+            lambda e: self._move_step(self.click_steps, self.click_steps_layout, e, -1),
+            lambda e: self._move_step(self.click_steps, self.click_steps_layout, e, 1),
+            lambda e: self._remove_step(self.click_steps, self.click_steps_layout, e))
+        entry.update({'frame': frame, 'num': num, 'x': sp_x, 'y': sp_y, 'delay': sp_d})
+
+        for widget in (sp_x, sp_y, sp_d):
+            widget.valueChanged.connect(self._on_ui_changed_for_save)
+        pos = len(self.click_steps) if index is None else max(0, min(len(self.click_steps), index))
+        self.click_steps.insert(pos, entry)
+        self.click_steps_layout.insertWidget(pos, frame)
+        self._refresh_step_numbers()
+        self._on_ui_changed_for_save()
+        return entry
+
+    def _add_key_step(self, key='enter', delay_ms=0, index=None):
+        """新增一个按键步骤。"""
+        entry = {}
+        frame, row = self._step_row()
+        num = QLabel("")
+        num.setFixedWidth(16)
+        num.setProperty("class", "meta")
+        edit = QLineEdit(str(key))
+        edit.setPlaceholderText("如 Enter / Tab / Ctrl+A / F5")
+        edit.setMinimumWidth(92)
+        edit.setToolTip("单个按键或组合键（用 + 连接表示同时按下）")
+        sp_d = QSpinBox()
+        sp_d.setRange(0, 3600000)
+        sp_d.setSuffix(" ms")
+        sp_d.setValue(int(delay_ms))
+        sp_d.setMinimumWidth(86)
+        sp_d.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        sp_d.setToolTip("发送这个按键之前等待的时长（毫秒）")
+
+        row.addWidget(num)
+        row.addWidget(edit, 1)
+        row.addWidget(sp_d)
+        self._step_buttons(
+            row, entry,
+            lambda e: self._move_step(self.key_steps, self.key_steps_layout, e, -1),
+            lambda e: self._move_step(self.key_steps, self.key_steps_layout, e, 1),
+            lambda e: self._remove_step(self.key_steps, self.key_steps_layout, e))
+        entry.update({'frame': frame, 'num': num, 'edit': edit, 'delay': sp_d})
+
+        edit.textChanged.connect(self._on_ui_changed_for_save)
+        sp_d.valueChanged.connect(self._on_ui_changed_for_save)
+        pos = len(self.key_steps) if index is None else max(0, min(len(self.key_steps), index))
+        self.key_steps.insert(pos, entry)
+        self.key_steps_layout.insertWidget(pos, frame)
+        self._refresh_step_numbers()
+        self._on_ui_changed_for_save()
+        return entry
+
+    def _move_step(self, steps, layout, entry, delta):
+        """在序列中上移/下移一个步骤，界面与数据同步换位。"""
+        i = steps.index(entry)
+        j = i + delta
+        if not 0 <= j < len(steps):
+            return
+        steps[i], steps[j] = steps[j], steps[i]
+        frame = entry['frame']
+        layout.removeWidget(frame)
+        layout.insertWidget(j, frame)
+        self._refresh_step_numbers()
+        self._on_ui_changed_for_save()
+
+    def _remove_step(self, steps, layout, entry):
+        if entry not in steps:
+            return
+        steps.remove(entry)
+        layout.removeWidget(entry['frame'])
+        entry['frame'].deleteLater()
+        self._refresh_step_numbers()
+        self._on_ui_changed_for_save()
+
+    def _clear_click_steps(self):
+        for entry in list(self.click_steps):
+            self._remove_step(self.click_steps, self.click_steps_layout, entry)
+
+    def _clear_key_steps(self):
+        for entry in list(self.key_steps):
+            self._remove_step(self.key_steps, self.key_steps_layout, entry)
+
+    def _refresh_step_numbers(self):
+        """重排两个序列的序号，并按空列表状态显示提示。"""
+        for i, entry in enumerate(getattr(self, 'click_steps', []), 1):
+            entry['num'].setText("%d." % i)
+        for i, entry in enumerate(getattr(self, 'key_steps', []), 1):
+            entry['num'].setText("%d." % i)
+        empty_click = getattr(self, 'lbl_click_empty', None)
+        if empty_click is not None:
+            empty_click.setVisible(not self.click_steps)
+        empty_key = getattr(self, 'lbl_key_empty', None)
+        if empty_key is not None:
+            empty_key.setVisible(not self.key_steps)
+
+    def _get_click_steps(self):
+        return [{'x': e['x'].value(), 'y': e['y'].value(), 'delay_ms': e['delay'].value()}
+                for e in self.click_steps]
+
+    def _set_click_steps(self, steps):
+        for entry in list(self.click_steps):
+            self.click_steps_layout.removeWidget(entry['frame'])
+            entry['frame'].deleteLater()
+        self.click_steps = []
+        for step in steps or []:
+            self._add_click_step(step.get('x', 0), step.get('y', 0), step.get('delay_ms', 0))
+        self._refresh_step_numbers()
+
+    def _get_key_steps(self):
+        return [{'key': e['edit'].text().strip(), 'delay_ms': e['delay'].value()}
+                for e in self.key_steps if e['edit'].text().strip()]
+
+    def _set_key_steps(self, steps):
+        for entry in list(self.key_steps):
+            self.key_steps_layout.removeWidget(entry['frame'])
+            entry['frame'].deleteLater()
+        self.key_steps = []
+        for step in steps or []:
+            self._add_key_step(step.get('key', 'enter'), step.get('delay_ms', 0))
+        self._refresh_step_numbers()
+
+    def _build_content_panel(self):
+        """右栏：发送内容工作台 —— 列表（顺序即发送顺序）＋ 编辑器 ＋ 可折叠附加文本。"""
+        card, layout, _ = self._card("发送内容", "📝")
+
+        # ── 工具条：增删改排序 + 导入 + 发送方案 ──
+        tb = QHBoxLayout()
+        tb.setSpacing(5)
+
+        def _mini(text, tip, slot):
+            btn = QPushButton(text)
+            btn.setProperty("class", "btn-mini")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            tb.addWidget(btn)
+            return btn
+
+        _mini("➕ 新增", "新增一条发送内容", lambda: self._add_prompt(''))
+        _mini("⧉ 复制", "在下方复制当前选中内容", self._duplicate_prompt)
+        _mini("🗑 删除", "删除当前选中内容", self._delete_prompt)
+        _mini("⬆", "上移（决定按顺序发送时的先后）", lambda: self._move_prompt(-1))
+        _mini("⬇", "下移（决定按顺序发送时的先后）", lambda: self._move_prompt(1))
+        _mini("📂 导入", "导入 .txt / .md，用 --- 分隔多条发送内容", self._import_send_file)
+
+        tb.addSpacing(6)
+        self.combo_strategy = QComboBox()
+        self.combo_strategy.addItem("顺序发送")
+        self.combo_strategy.addItem("随机发送")
+        self.combo_strategy.setToolTip("多条内容的发送方案：按顺序轮转 / 每次随机抽取一条")
+        self.combo_strategy.currentIndexChanged.connect(self._on_ui_changed_for_save)
+        tb.addWidget(self.combo_strategy)
+
+        tb.addStretch()
+        layout.addLayout(tb)
+
+        # ── 主体：内容列表 ｜ 编辑区（可拖拽分隔） ──
+        self.prompt_list = QListWidget()
+        self.prompt_list.setProperty("class", "prompt-list")
+        self.prompt_list.setMinimumWidth(230)
+        # 摘要超长时省略号截断，不出现横向滚动条（完整首行与字数见条目提示）
+        self.prompt_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.prompt_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.prompt_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.prompt_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.prompt_list.setToolTip("选中一条后即可在右侧编辑；可直接拖拽调整顺序")
+        self.prompt_list.currentRowChanged.connect(self._on_prompt_row_changed)
+        self.prompt_list.model().rowsMoved.connect(self._on_prompt_rows_moved)
+
+        self.prompt_edit = QPlainTextEdit()
+        self.prompt_edit.setPlaceholderText("在此编辑选中内容（可多行，整块作为一条发送）")
+        self.prompt_edit.textChanged.connect(self._on_prompt_text_changed)
+
+        # 列表 + 统计脚注（条目数与字数紧随内容列表）
+        list_col = QWidget()
+        list_col_layout = QVBoxLayout(list_col)
+        list_col_layout.setContentsMargins(0, 0, 0, 0)
+        list_col_layout.setSpacing(4)
+        list_col_layout.addWidget(self.prompt_list, 1)
+        self.lbl_prompt_count = QLabel("0 条")
+        self.lbl_prompt_count.setProperty("class", "meta")
+        self.lbl_prompt_count.setAlignment(Qt.AlignmentFlag.AlignRight)
+        list_col_layout.addWidget(self.lbl_prompt_count)
+
+        self.split_prompt = QSplitter(Qt.Orientation.Horizontal)
+        self.split_prompt.setChildrenCollapsible(False)
+        self.split_prompt.setHandleWidth(6)
+        self.split_prompt.addWidget(list_col)
+        self.split_prompt.addWidget(self.prompt_edit)
+        self.split_prompt.setStretchFactor(0, 0)
+        self.split_prompt.setStretchFactor(1, 1)
+        self.split_prompt.setSizes([260, 480])
+        layout.addWidget(self.split_prompt, 1)
+
+        # ── 附加前言（可选，折叠） ──
+        box, body, head, _ = self._collapsible_section("附加前言", "每次发送时自动置于每条内容开头")
         self.preface_edit = QPlainTextEdit()
-        self.preface_edit.setPlaceholderText("（可选）在每条发送内容的开头 附加这一份相同内容...")
+        self.preface_edit.setPlaceholderText("（可选）在每条发送内容的开头附加这一份相同内容...")
         self.preface_edit.setFixedHeight(int(self.preface_edit.fontMetrics().lineSpacing() * 3) + 12)
         self.preface_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.preface_edit.textChanged.connect(self._on_ui_changed_for_save)
-        layout.addWidget(self.preface_edit)
+        body.addWidget(self.preface_edit)
+        layout.addWidget(box)
+        self._preface_head = head
 
-        # 追加后续（发送主内容后，延时指定时长再发送）
-        suffix_head = QHBoxLayout()
-        s_title = QLabel("[追加后续]")
-        s_title.setStyleSheet("font-size: 9.5pt; font-weight: 700; color: #9fb7e6;")
-        suffix_head.addWidget(s_title)
-        s_tip = QLabel("发送每一条主内容之后 延时发送这里补充的内容")
-        s_tip.setStyleSheet("color: #5f739a; font-size: 8.5pt;")
-        suffix_head.addWidget(s_tip)
-        suffix_head.addStretch()
-        layout.addLayout(suffix_head)
-
+        # ── 追加后续（可选，折叠） ──
+        box, body, head, _ = self._collapsible_section("追加后续", "每条主内容发送后，延时再补发一段")
         self.suffix_edit = QPlainTextEdit()
         self.suffix_edit.setPlaceholderText("（可选）每一次发送主内容之后 再延迟追加的后续内容...")
         self.suffix_edit.setFixedHeight(int(self.suffix_edit.fontMetrics().lineSpacing() * 3) + 12)
         self.suffix_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.suffix_edit.textChanged.connect(self._on_ui_changed_for_save)
-        layout.addWidget(self.suffix_edit)
+        body.addWidget(self.suffix_edit)
 
         delay_row = QHBoxLayout()
         delay_row.setSpacing(8)
@@ -1330,54 +2101,15 @@ class MainWindow(QMainWindow):
         self.suffix_delay_spin.setMinimumHeight(26)
         self.suffix_delay_spin.valueChanged.connect(self._on_ui_changed_for_save)
         delay_row.addWidget(self.suffix_delay_spin)
-        delay_row.addWidget(QLabel("（循环模式，不得超过任务间隔，避免冲突）"))
+        hint = QLabel("循环模式下不得超过任务间隔")
+        hint.setProperty("class", "hint")
+        delay_row.addWidget(hint)
         delay_row.addStretch()
-        layout.addLayout(delay_row)
+        body.addLayout(delay_row)
+        layout.addWidget(box)
+        self._suffix_head = head
 
-        # 滚动区
-        self.prompt_scroll = QScrollArea()
-        self.prompt_scroll.setWidgetResizable(True)
-        self.prompt_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.prompt_container = QWidget()
-        self.prompt_list_layout = QVBoxLayout(self.prompt_container)
-        self.prompt_list_layout.setContentsMargins(0, 0, 0, 0)
-        self.prompt_list_layout.setSpacing(6)
-        self.prompt_list_layout.addStretch()
-        self.prompt_scroll.setWidget(self.prompt_container)
-        self.prompt_scroll.setMinimumHeight(180)
-        layout.addWidget(self.prompt_scroll, 1)
-
-        # 底部操作行
-        bottom = QHBoxLayout()
-        bottom.setSpacing(10)
-
-        btn_add = QPushButton("➕ 添加一条内容")
-        btn_add.setProperty("class", "btn-ghost")
-        btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_add.clicked.connect(lambda: self.add_prompt_card())
-        bottom.addWidget(btn_add)
-
-        btn_import = QPushButton("📂 导入.txt内容(用---分割)")
-        btn_import.setProperty("class", "btn-ghost")
-        btn_import.setToolTip("导入 .txt / .md，用 --- 分隔多条发送内容")
-        btn_import.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_import.clicked.connect(self._import_send_file)
-        bottom.addWidget(btn_import)
-
-        bottom.addSpacing(10)
-        bottom.addWidget(QLabel("多条内容的发送方案:"))
-        self.combo_strategy = QComboBox()
-        self.combo_strategy.addItem("按顺序")
-        self.combo_strategy.addItem("纯随机")
-        self.combo_strategy.currentIndexChanged.connect(self._on_ui_changed_for_save)
-        bottom.addWidget(self.combo_strategy)
-
-        bottom.addStretch()
-        self.lbl_prompt_count = QLabel("共 0 条")
-        self.lbl_prompt_count.setStyleSheet("color: #7a93c0; font-size: 9pt;")
-        bottom.addWidget(self.lbl_prompt_count)
-
-        layout.addLayout(bottom)
+        return card
 
     def _build_schedule_card(self, layout):
         # 分段控件：单次 / 循环
@@ -1452,7 +2184,7 @@ class MainWindow(QMainWindow):
         self.loop_start_dt = QDateTimeEdit(QDateTime.currentDateTime().addSecs(60))
         self.loop_start_dt.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
         self.loop_start_dt.setCalendarPopup(True)
-        self.loop_start_dt.setMinimumHeight(48)
+        self.loop_start_dt.setMinimumHeight(42)
         self.loop_start_dt.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.loop_start_dt.setStyleSheet("QDateTimeEdit { font-size: 12pt; font-weight: 600; }")
         lp.addWidget(self.loop_start_dt)
@@ -1461,7 +2193,7 @@ class MainWindow(QMainWindow):
         self.loop_end_dt = QDateTimeEdit(QDateTime.currentDateTime().addDays(7))
         self.loop_end_dt.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
         self.loop_end_dt.setCalendarPopup(True)
-        self.loop_end_dt.setMinimumHeight(48)
+        self.loop_end_dt.setMinimumHeight(42)
         self.loop_end_dt.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.loop_end_dt.setStyleSheet("QDateTimeEdit { font-size: 12pt; font-weight: 600; }")
         lp.addWidget(self.loop_end_dt)
@@ -1474,7 +2206,7 @@ class MainWindow(QMainWindow):
         self.spin_interval.setRange(1, 1440)
         self.spin_interval.setValue(10)
         self.spin_interval.setSuffix(" 分钟")
-        self.spin_interval.setMinimumHeight(48)
+        self.spin_interval.setMinimumHeight(42)
         self.spin_interval.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.spin_interval.setStyleSheet("QSpinBox { font-size: 12pt; font-weight: 600; }")
         opt_row.addWidget(self.spin_interval)
@@ -1499,8 +2231,12 @@ class MainWindow(QMainWindow):
 
         self.list_schedule = QListWidget()
         # 预览列表吸收循环设置三行紧凑后让出的垂直空间
-        self.list_schedule.setMinimumHeight(90)
+        self.list_schedule.setMinimumHeight(76)
         self.list_schedule.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # 触发时间条目宽度不参与 sizeHint，超长时省略号截断，避免撑宽左栏
+        self.list_schedule.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_schedule.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.list_schedule.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         layout.addWidget(self.list_schedule, 1)
 
         # 连接所有变化信号（预览刷新 + 自动保存）
@@ -1515,25 +2251,6 @@ class MainWindow(QMainWindow):
         self.spin_interval.valueChanged.connect(lambda _: self._sync_suffix_limit())
         self.chk_immediate.toggled.connect(self._refresh_schedule_preview)
         self.chk_immediate.toggled.connect(self._on_ui_changed_for_save)
-
-    def _build_countdown_card(self, layout):
-        self.lbl_countdown = QLabel("--:--:--")
-        self.lbl_countdown.setProperty("class", "countdown")
-        self.lbl_countdown.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.lbl_countdown)
-
-        self.lbl_countdown_label = QLabel("等待启动...")
-        self.lbl_countdown_label.setProperty("class", "countdown-label")
-        self.lbl_countdown_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.lbl_countdown_label)
-
-    def _build_log_card(self, layout):
-        self.log_view = QTextEdit()
-        self.log_view.setProperty("class", "log-view")
-        self.log_view.setReadOnly(True)
-        self.log_view.setMinimumHeight(56)   # 日志卡片约占左列15%，保持紧凑
-        self.log_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        layout.addWidget(self.log_view)
 
     # ── 模式切换 ─────────────────────────────────────────────
 
@@ -1601,6 +2318,8 @@ class MainWindow(QMainWindow):
         else:
             self._run_edit_notified = False
         self._dirty = True
+        if hasattr(self, 'lbl_save_state'):
+            self.lbl_save_state.setText("● 未保存…")
         self._pending_save = True
         if not hasattr(self, '_debounce_timer'):
             self._debounce_timer = QTimer(self)
@@ -1628,8 +2347,13 @@ class MainWindow(QMainWindow):
             'strategy': 'random' if self.combo_strategy.currentIndex() == 1 else 'sequence',
             'interval_min': self.spin_interval.value(),
             'run_immediately': self.chk_immediate.isChecked(),
-            'click_x': self.spin_x.value(),
-            'click_y': self.spin_y.value(),
+            'lock_input': self.chk_lock_input.isChecked(),
+            'paste': self.chk_paste.isChecked(),
+            'click_steps': self._get_click_steps(),
+            'key_steps': self._get_key_steps(),
+            # 旧键保留：仅记录首个点击点，便于旧版本或外部工具仍能读到坐标
+            'click_x': self.click_steps[0]['x'].value() if self.click_steps else 0,
+            'click_y': self.click_steps[0]['y'].value() if self.click_steps else 0,
             'window_title': self.win_combo.currentText(),
             'single_dt': self._combine_dt(self.single_dt),
             'loop_start_dt': self._combine_dt(self.loop_start_dt),
@@ -1650,9 +2374,13 @@ class MainWindow(QMainWindow):
         try:
             save_config_file({'general': self._collect_persist_dict()}, self._config_file)
             self._dirty = False
+            if hasattr(self, 'lbl_save_state'):
+                self.lbl_save_state.setText("已保存 " + datetime.datetime.now().strftime('%H:%M:%S'))
         except Exception as e:
             # 写盘失败：保持 dirty，避免误判已保存而失去对未落盘编辑的保护
             self._dirty = True
+            if hasattr(self, 'lbl_save_state'):
+                self.lbl_save_state.setText("● 保存失败")
             print(f"[保存失败] 配置写入未成功：{e}")
         finally:
             try:
@@ -1677,8 +2405,21 @@ class MainWindow(QMainWindow):
 
         self.spin_interval.setValue(int(cfg.get('interval_min', 10)))
         self.chk_immediate.setChecked(bool(cfg.get('run_immediately', False)))
-        self.spin_x.setValue(int(cfg.get('click_x', 0)))
-        self.spin_y.setValue(int(cfg.get('click_y', 0)))
+        self.chk_lock_input.setChecked(bool(cfg.get('lock_input', True)))
+        self.chk_paste.setChecked(bool(cfg.get('paste', True)))
+
+        # 点击 / 按键序列：优先读新键；旧配置只有单点坐标时迁移成一个点击点
+        click_steps = cfg.get('click_steps') or []
+        if not click_steps:
+            old_x, old_y = int(cfg.get('click_x', 0) or 0), int(cfg.get('click_y', 0) or 0)
+            if old_x != 0 or old_y != 0:
+                click_steps = [{'x': old_x, 'y': old_y, 'delay_ms': 0}]
+        self._set_click_steps(click_steps)
+
+        key_steps = cfg.get('key_steps') or []
+        if not key_steps:
+            key_steps = [{'key': 'enter', 'delay_ms': 0}]      # 旧配置默认回车
+        self._set_key_steps(key_steps)
 
         # 匹配目标窗口标题
         wt = cfg.get('window_title', '')
@@ -1705,6 +2446,8 @@ class MainWindow(QMainWindow):
         self.preface_edit.setPlainText(cfg.get('preface', ''))
         self.suffix_edit.setPlainText(cfg.get('suffix', ''))
         self.suffix_delay_spin.setValue(int(cfg.get('suffix_delay', 0)))
+        self.chk_lock_input.setChecked(bool(cfg.get('lock_input', True)))
+        self._sync_optional_sections()
 
         self._set_loading_flag(False)
         self._refresh_schedule_preview()
@@ -1732,14 +2475,19 @@ class MainWindow(QMainWindow):
         self._append_log("🔄  配置热更新：已重新加载 config-win-auto-sender.ini")
 
     def _set_prompts(self, prompts):
-        """用给定列表重建所有提示词卡片。"""
-        for edit in list(self.prompt_cards):
-            self._remove_prompt_card(edit)
-        for text in prompts:
-            if text:
-                self.add_prompt_card(text)
-        if not self.prompt_cards:
-            self.add_prompt_card()
+        """用给定列表重建内容工作台（顺序即发送顺序，至少保留一条）。"""
+        self.prompt_list.clear()
+        for text in (prompts or ['']):
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, text or '')
+            self.prompt_list.addItem(item)
+        if self.prompt_list.count() == 0:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, '')
+            self.prompt_list.addItem(item)
+        self._refresh_prompt_items()
+        self.prompt_list.setCurrentRow(0)
+        self._update_prompt_count()
 
     # ── 导入发送内容文件 ──────────────────────────────────────
 
@@ -1810,8 +2558,6 @@ class MainWindow(QMainWindow):
         if not hwnd:
             self._append_log("⚠️  未捕获到有效窗口，请把准星拖到目标窗口内部再松开。")
             return
-        self.spin_x.setValue(x)
-        self.spin_y.setValue(y)
 
         idx = -1
         for i in range(self.win_combo.count()):
@@ -1824,85 +2570,136 @@ class MainWindow(QMainWindow):
             self.win_combo.insertItem(0, title, hwnd)
             self.win_combo.setCurrentIndex(0)
 
+        # 捕获点直接追加为点击序列的下一步：拖几次即可得到多段点击
+        self._add_click_step(x, y, 0)
+
         # 捕获是用户显式动作：即使坐标/选中项未变化也要标记改动并持久化，
         # 否则附属窗口关闭时会被当作「未使用实例」静默删除配置
         self._on_ui_changed_for_save()
-        self._append_log(f"🎯 已捕获目标 — 窗口：{title}，坐标：({x}, {y})")
+        self._append_log(f"🎯 已捕获目标 — 窗口：{title}，坐标：({x}, {y})，"
+                         f"已作为第 {len(self.click_steps)} 个点击点")
 
-    # ── 提示词卡片 ──────────────────────────────────────────
+    # ── 发送内容：列表 + 编辑器 ──────────────────────────────
 
-    def add_prompt_card(self, text=''):
-        idx = len(self.prompt_cards) + 1
+    @staticmethod
+    def _prompt_summary(idx, text):
+        """列表摘要：编号 + 首行（超长截断）。完整首行与字数见条目提示。"""
+        lines = text.strip().splitlines()
+        first = lines[0].strip() if lines else ''
+        if len(first) > 16:
+            first = first[:16] + "…"
+        return f"{idx}. {first or '（空）'}"
 
-        edit = QPlainTextEdit()
-        # 每条固定占 3 行高度，不随内容动态变高
-        line_h = edit.fontMetrics().lineSpacing()
-        edit.setFixedHeight(int(line_h * 3) + 12)
-        edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        edit.setPlaceholderText(f"第 {idx} 条内容（可多行，整块作为一条发送）")
-        if text:
-            edit.setPlainText(text)
-        edit.textChanged.connect(self._update_prompt_count)
-        edit.textChanged.connect(self._on_ui_changed_for_save)
+    @staticmethod
+    def _prompt_item_text(item):
+        return item.data(Qt.ItemDataRole.UserRole) or ''
 
-        btn_del = QPushButton("✕")
-        btn_del.setProperty("class", "btn-icon-del")
-        btn_del.setFixedSize(24, 24)
-        btn_del.setToolTip("删除该条")
-        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_del.clicked.connect(lambda: self._remove_prompt_card(edit))
-
-        # 编号
-        num_lbl = QLabel(f"<b style='color:#00d4ff;'>{idx}</b>")
-        num_lbl.setFixedWidth(22)
-        num_lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
-        num_lbl.setStyleSheet("padding-top: 6px;")
-
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
-        row.addWidget(num_lbl)
-        row.addWidget(edit, 1)
-        row.addWidget(btn_del, 0, Qt.AlignmentFlag.AlignTop)
-
-        card = QFrame()
-        card.setLayout(row)
-        card.setStyleSheet("QFrame { background: #0e1c33; border: 1px solid #1f3560; border-radius: 6px; }")
-        self.prompt_cards.append(edit)
-        self.prompt_list_layout.insertWidget(self.prompt_list_layout.count() - 1, card)
-        self.prompt_scroll.verticalScrollBar().setValue(self.prompt_scroll.verticalScrollBar().maximum())
-        self._update_prompt_count()
-        self._renumber_prompts()
-        # 增删卡片是用户显式动作（内容可能仍为空，不会触发 textChanged），需显式标记改动
-        self._on_ui_changed_for_save()
-        return edit
-
-    def _remove_prompt_card(self, edit):
-        if edit not in self.prompt_cards:
+    def _apply_prompt_item(self, item, idx):
+        """把编号 / 摘要 / 提示写到单个条目（内容不变）。"""
+        text = self._prompt_item_text(item)
+        item.setText(self._prompt_summary(idx, text))
+        if not text.strip():
+            item.setToolTip("（空内容，发送时自动跳过）")
             return
-        self.prompt_cards.remove(edit)
-        card = edit.parentWidget()
-        self.prompt_list_layout.removeWidget(card)
-        card.deleteLater()
+        lines = text.strip().splitlines()
+        head = lines[0].strip()
+        item.setToolTip((head[:80] + ("…" if len(head) > 80 else "")) + f"\n共 {len(text)} 字")
+
+    def _refresh_prompt_items(self):
+        """按当前顺序重建编号、摘要与提示（不改动条目内容与顺序）。"""
+        for i in range(self.prompt_list.count()):
+            self._apply_prompt_item(self.prompt_list.item(i), i + 1)
+
+    def _add_prompt(self, text=''):
+        """新增一条内容并选中它（空内容也允许，发送时自动跳过）。"""
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, text)
+        self.prompt_list.addItem(item)
+        self._refresh_prompt_items()
+        self.prompt_list.setCurrentItem(item)
         self._update_prompt_count()
-        self._renumber_prompts()
+        self._on_ui_changed_for_save()
+        return item
+
+    def _delete_prompt(self):
+        row = self.prompt_list.currentRow()
+        if row < 0:
+            return
+        self.prompt_list.takeItem(row)
+        if self.prompt_list.count() == 0:
+            self._set_prompts([''])   # 工作台不留空白，始终保留一条待编辑
+            self._on_ui_changed_for_save()
+            return
+        self.prompt_list.setCurrentRow(min(row, self.prompt_list.count() - 1))
+        self._refresh_prompt_items()
+        self._update_prompt_count()
         self._on_ui_changed_for_save()
 
-    def _renumber_prompts(self):
-        """删除后重新编号"""
-        for i, edit in enumerate(self.prompt_cards, 1):
-            card = edit.parentWidget()
-            num_lbl = card.findChild(QLabel)
-            if num_lbl:
-                num_lbl.setText(f"<b style='color:#00d4ff;'>{i}</b>")
-            edit.setPlaceholderText(f"第 {i} 条内容（可多行，整块作为一条发送）")
+    def _duplicate_prompt(self):
+        row = self.prompt_list.currentRow()
+        if row < 0:
+            return
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, self._prompt_item_text(self.prompt_list.item(row)))
+        self.prompt_list.insertItem(row + 1, item)
+        self.prompt_list.setCurrentItem(item)
+        self._refresh_prompt_items()
+        self._update_prompt_count()
+        self._on_ui_changed_for_save()
+
+    def _move_prompt(self, delta):
+        """上移 / 下移当前条目（决定按顺序发送时的先后）。"""
+        row = self.prompt_list.currentRow()
+        target = row + delta
+        if row < 0 or not 0 <= target < self.prompt_list.count():
+            return
+        item = self.prompt_list.takeItem(row)
+        self.prompt_list.insertItem(target, item)
+        self.prompt_list.setCurrentItem(item)
+        self._refresh_prompt_items()
+        self._on_ui_changed_for_save()
+
+    def _on_prompt_row_changed(self, row):
+        """切换选中条目：把内容回填到编辑区（抑制回写）。"""
+        if not 0 <= row < self.prompt_list.count():
+            return
+        self._prompt_loading = True
+        try:
+            self.prompt_edit.setPlainText(self._prompt_item_text(self.prompt_list.item(row)))
+        finally:
+            self._prompt_loading = False
+
+    def _on_prompt_text_changed(self):
+        """编辑区改动 → 实时回写当前条目（摘要/统计/配置同步更新）。"""
+        if self._prompt_loading:
+            return
+        item = self.prompt_list.currentItem()
+        if item is None:
+            return
+        text = self.prompt_edit.toPlainText()
+        item.setData(Qt.ItemDataRole.UserRole, text)
+        self._apply_prompt_item(item, self.prompt_list.currentRow() + 1)
+        self._update_prompt_count()
+        self._on_ui_changed_for_save()
+
+    def _on_prompt_rows_moved(self, *_):
+        """拖拽排序后重排编号并持久化。"""
+        self._refresh_prompt_items()
+        self._on_ui_changed_for_save()
 
     def get_prompt_list(self):
-        return [edit.toPlainText().strip() for edit in self.prompt_cards if edit.toPlainText().strip()]
+        return [self._prompt_item_text(self.prompt_list.item(i)).strip()
+                for i in range(self.prompt_list.count())
+                if self._prompt_item_text(self.prompt_list.item(i)).strip()]
 
     def _update_prompt_count(self):
-        n = len(self.get_prompt_list())
-        self.lbl_prompt_count.setText(f"共 {n} 条" if n else "共 0 条")
+        texts = [self._prompt_item_text(self.prompt_list.item(i)).strip()
+                 for i in range(self.prompt_list.count())]
+        texts = [t for t in texts if t]
+        if not texts:
+            self.lbl_prompt_count.setText("0 条")
+            return
+        self.lbl_prompt_count.setText(f"{len(texts)} 条 · {sum(len(t) for t in texts)} 字")
 
     # ── 时间 / 预览 ──────────────────────────────────────────
 
@@ -2064,16 +2861,28 @@ class MainWindow(QMainWindow):
                     "按当前开始/结束时间与间隔，结束时间之前已无可用触发时刻。\n请调整时间或间隔后重试。")
                 return None
 
+        # 按键序列先校验按键名，避免运行到一半才发现无法识别
+        key_steps = self._get_key_steps()
+        bad_keys = [s['key'] for s in key_steps if parse_key_combo(s['key']) is None]
+        if bad_keys:
+            QMessageBox.warning(self, "配置错误",
+                                "以下按键无法识别：%s\n请改成 Enter / Tab / Ctrl+A / F5 这类写法。"
+                                % '、'.join(bad_keys))
+            return None
+
         return {
             'hwnd': hwnd,
             'prompts': prompts,
             'strategy': 'random' if self.combo_strategy.currentIndex() == 1 else 'sequence',
-            'click_pos': (self.spin_x.value(), self.spin_y.value()),
+            'click_steps': self._get_click_steps(),
+            'key_steps': key_steps,
+            'paste': self.chk_paste.isChecked(),
             'mode': 'single' if is_single else 'loop',
             'start_dt': start_dt,
             'end_dt': end_dt,
             'interval_min': self.spin_interval.value(),
             'run_immediately': self.chk_immediate.isChecked(),
+            'lock_input': self.chk_lock_input.isChecked(),
             'preface': self.preface_edit.toPlainText(),
             'suffix': self.suffix_edit.toPlainText(),
             'suffix_delay': self.suffix_delay_spin.value(),
@@ -2179,7 +2988,8 @@ class MainWindow(QMainWindow):
         text = compose_send_text(cfg.get('preface', ''), prompt)
         # 后台线程发送，防止阻塞 GUI（发送含提前 1s 锁输入 + 键鼠模拟，内部互斥排队最坏数秒）
         self._test_busy = True
-        self._test_thread = TestSendThread(cfg['hwnd'], text, cfg['click_pos'])
+        self._test_thread = TestSendThread(cfg['hwnd'], text, cfg['click_steps'], cfg['key_steps'],
+                                           cfg.get('paste', True), cfg.get('lock_input', True))
         self._test_thread.done_signal.connect(self._on_test_done)
         # 线程引用同样在 finished 后释放，避免 run() 未退出时被析构
         self._test_thread.finished.connect(self._on_test_finished)
@@ -2234,6 +3044,7 @@ class MainWindow(QMainWindow):
         if not self._cleanup_tmp_config():
             event.ignore()
             return
+        self._save_ui_state()
         event.accept()
 
     def _flush_before_close(self):
@@ -2352,8 +3163,12 @@ class MainWindow(QMainWindow):
             'strategy': 'sequence',
             'interval_min': 10,
             'run_immediately': False,
+            'lock_input': True,
+            'paste': True,
             'click_x': 0,
             'click_y': 0,
+            'click_steps': [],
+            'key_steps': [{'key': 'enter', 'delay_ms': 0}],
             'window_title': '',
             'single_dt': now + datetime.timedelta(seconds=60),
             'loop_start_dt': now + datetime.timedelta(seconds=60),
