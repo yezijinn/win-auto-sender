@@ -36,12 +36,15 @@ from PySide6.QtWidgets import (
     QLabel, QComboBox, QPushButton, QSpinBox, QMessageBox,
     QListWidget, QListWidgetItem, QScrollArea, QPlainTextEdit,
     QDateTimeEdit, QCheckBox, QFrame, QSizePolicy, QSplitter,
-    QTextEdit, QButtonGroup, QFileDialog, QAbstractItemView, QLineEdit, QAbstractSpinBox
+    QTextEdit, QButtonGroup, QFileDialog, QAbstractItemView, QLineEdit,
+    QProxyStyle, QStyle, QStyleFactory
 )
 from PySide6.QtCore import (
-    Qt, QDateTime, QThread, Signal, QTimer, QFileSystemWatcher, QSettings
+    Qt, QDateTime, QThread, Signal, QTimer, QFileSystemWatcher, QSettings, QPointF, QRectF
 )
-from PySide6.QtGui import QFont, QCursor, QPainter, QPen, QColor, QKeyEvent
+from PySide6.QtGui import (
+    QFont, QCursor, QPainter, QPen, QColor, QKeyEvent, QBrush, QLinearGradient
+)
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -672,7 +675,7 @@ QPushButton[class~="seg-btn"] {
     background-color: #0e1c33;
     color: #7a93c0;
     border: 1px solid #1f3560;
-    padding: 8px 22px;
+    padding: 8px 14px;
     font-weight: 500;
 }
 QPushButton[class~="seg-btn-left"] {
@@ -896,24 +899,20 @@ QFrame[class="picker-box"] {
 }
 
 /* ===== 复选框 ===== */
+/* 指示器由 CheckIndicatorStyle 自绘（空心框 / 蓝底白勾），样式表只管文字状态 */
 QCheckBox {
-    spacing: 8px;
-    color: #b8ccf0;
+    spacing: 9px;
+    color: #9fb2d6;
 }
-QCheckBox::indicator {
-    width: 16px;
-    height: 16px;
-    border: 2px solid #3d5d94;
-    border-radius: 4px;
-    background: #0e1c33;
+QCheckBox:hover {
+    color: #c2dbff;
 }
-QCheckBox::indicator:hover {
-    border-color: #00b8ff;
+QCheckBox:checked {
+    color: #eaf4ff;
+    font-weight: 600;
 }
-QCheckBox::indicator:checked {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #00b8ff, stop:1 #3d7bff);
-    border-color: #00d4ff;
+QCheckBox:disabled {
+    color: #5a6f92;
 }
 
 /* ===== 状态文字（纯文字，无背景填充） ===== */
@@ -1101,6 +1100,71 @@ QSplitter::handle:vertical {
 }
 
 """
+
+
+# ═══════════════════════════════════════════════════════════════
+#  复选框指示器样式
+# ═══════════════════════════════════════════════════════════════
+
+class CheckIndicatorStyle(QProxyStyle):
+    """自绘复选框指示器：未勾选是空心方框，已勾选是蓝色实心 + 白色对勾。
+
+    样式表不参与指示器绘制（去掉 ::indicator 规则），避免 QStyleSheetStyle
+    用纯色块覆盖掉对勾；高分屏下按矢量绘制，不依赖任何图片资源。
+    """
+
+    BOX = 18
+
+    def pixelMetric(self, metric, option=None, widget=None):
+        if metric in (QStyle.PixelMetric.PM_IndicatorWidth, QStyle.PixelMetric.PM_IndicatorHeight):
+            return self.BOX
+        if metric == QStyle.PixelMetric.PM_CheckBoxLabelSpacing:
+            return 9
+        return super().pixelMetric(metric, option, widget)
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if element != QStyle.PrimitiveElement.PE_IndicatorCheckBox:
+            super().drawPrimitive(element, option, painter, widget)
+            return
+        state = option.state
+        checked = bool(state & QStyle.StateFlag.State_On)
+        partial = bool(state & QStyle.StateFlag.State_NoChange)
+        enabled = bool(state & QStyle.StateFlag.State_Enabled)
+        hover = bool(state & QStyle.StateFlag.State_MouseOver)
+
+        size = float(self.BOX)
+        center = option.rect.center()
+        box = QRectF(center.x() - size / 2.0, center.y() - size / 2.0, size, size)
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if checked or partial:
+            grad = QLinearGradient(box.topLeft(), box.bottomRight())
+            grad.setColorAt(0.0, QColor('#00d4ff') if enabled else QColor('#2b4a73'))
+            grad.setColorAt(1.0, QColor('#3d7bff') if enabled else QColor('#233f68'))
+            painter.setBrush(QBrush(grad))
+            painter.setPen(QPen(QColor('#8fe6ff') if enabled else QColor('#3a5c8a'), 1.5))
+            painter.drawRoundedRect(box.adjusted(0.75, 0.75, -0.75, -0.75), 5.0, 5.0)
+            pen = QPen(QColor('#ffffff') if enabled else QColor('#8da2c0'))
+            pen.setWidthF(2.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            if partial:
+                painter.drawLine(QPointF(box.left() + size * 0.28, box.center().y()),
+                                 QPointF(box.right() - size * 0.28, box.center().y()))
+            else:
+                painter.drawPolyline([
+                    QPointF(box.left() + size * 0.24, box.center().y() + size * 0.03),
+                    QPointF(box.left() + size * 0.42, box.top() + size * 0.72),
+                    QPointF(box.left() + size * 0.78, box.top() + size * 0.28),
+                ])
+        else:
+            painter.setBrush(QBrush(QColor('#0a1524') if enabled else QColor('#0d1a2c')))
+            border = QColor('#00b8ff') if hover else (QColor('#4a6d9e') if enabled else QColor('#31456a'))
+            painter.setPen(QPen(border, 1.8))
+            painter.drawRoundedRect(box.adjusted(0.9, 0.9, -0.9, -0.9), 5.0, 5.0)
+        painter.restore()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1324,9 +1388,9 @@ class MainWindow(QMainWindow):
         if is_admin():
             title += "  ·  管理员模式"
         self.setWindowTitle(title)
-        # 可缩放窗口：默认 1180x780，最小 1040x640（分栏/日志区可拖拽调整）
-        self.setMinimumSize(1040, 640)
-        self.resize(1180, 780)
+        # 可缩放窗口：上下分栏后宽度需求大幅下降，默认 1240x900，最小 900x660
+        self.setMinimumSize(1180, 660)
+        self.resize(1290, 880)
 
         self.worker = None
         self.next_fire_time = None  # 用于倒计时显示
@@ -1421,25 +1485,18 @@ class MainWindow(QMainWindow):
         # ─── 顶部工具栏：身份 / 状态 / 时间 / 倒计时 / 配置操作 ───
         root.addWidget(self._build_toolbar())
 
-        # ─── 主体：左右分栏（可拖拽）＋ 底部日志（可折叠） ───
+        # ─── 主体：上下三段（设置区 / 发送内容 / 运行日志），高度可拖拽 ───
         self.split_v = QSplitter(Qt.Orientation.Vertical)
         self.split_v.setChildrenCollapsible(False)
         self.split_v.setHandleWidth(6)
-
-        self.split_h = QSplitter(Qt.Orientation.Horizontal)
-        self.split_h.setChildrenCollapsible(False)
-        self.split_h.setHandleWidth(6)
-        self.split_h.addWidget(self._build_settings_panel())
-        self.split_h.addWidget(self._build_content_panel())
-        self.split_h.setStretchFactor(0, 0)
-        self.split_h.setStretchFactor(1, 1)
-        self.split_h.setSizes([450, 700])
-
-        self.split_v.addWidget(self.split_h)
-        self.split_v.addWidget(self._build_log_panel())
-        self.split_v.setStretchFactor(0, 1)
-        self.split_v.setStretchFactor(1, 0)
-        self.split_v.setSizes([650, 130])
+        self.split_v.addWidget(self._build_settings_panel())
+        self.split_v.addWidget(self._build_content_panel())
+        self.log_panel = self._build_log_panel()
+        self.split_v.addWidget(self.log_panel)
+        self.split_v.setStretchFactor(0, 0)
+        self.split_v.setStretchFactor(1, 1)
+        self.split_v.setStretchFactor(2, 0)
+        self.split_v.setSizes([390, 330, 120])
 
         root.addWidget(self.split_v, 1)
 
@@ -1495,32 +1552,36 @@ class MainWindow(QMainWindow):
         return bar
 
     def _build_settings_panel(self):
-        """左栏：目标窗口 → 触发计划 → 发送行为，纵向可滚动，宽度可拖拽。"""
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(430)
+        """设置区：三列并排（目标与点击序列 / 触发计划 / 发送动作），列宽可拖拽，各列内部可滚动。"""
+        self.split_set = QSplitter(Qt.Orientation.Horizontal)
+        self.split_set.setChildrenCollapsible(False)
+        self.split_set.setHandleWidth(6)
 
-        inner = QWidget()
-        col = QVBoxLayout(inner)
-        col.setContentsMargins(0, 0, 6, 0)
-        col.setSpacing(10)
+        for title, icon, builder in (
+            ("目标窗口与点击序列", "🎯", self._build_target_card),
+            ("触发计划", "⏰", self._build_schedule_card),
+            ("发送动作", "⚙️", self._build_behavior_card),
+        ):
+            card, card_layout, _ = self._card(title, icon)
+            builder(card_layout)
 
-        target_card, target_layout, _ = self._card("目标窗口", "🎯")
-        self._build_target_card(target_layout)
-        col.addWidget(target_card)
+            holder = QWidget()
+            holder_layout = QVBoxLayout(holder)
+            holder_layout.setContentsMargins(0, 0, 0, 0)
+            holder_layout.addWidget(card)
+            holder_layout.addStretch()      # 卡片保持自然高度，空白留在下方
 
-        sched_card, sched_layout, _ = self._card("触发计划", "⏰")
-        self._build_schedule_card(sched_layout)
-        col.addWidget(sched_card, 1)
+            col = QScrollArea()
+            col.setWidgetResizable(True)
+            col.setFrameShape(QFrame.Shape.NoFrame)
+            col.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            col.setWidget(holder)
+            self.split_set.addWidget(col)
 
-        behavior_card, behavior_layout, _ = self._card("发送行为", "⚙️")
-        self._build_behavior_card(behavior_layout)
-        col.addWidget(behavior_card)
-
-        scroll.setWidget(inner)
-        return scroll
+        for i in range(3):
+            self.split_set.setStretchFactor(i, 1)
+        self.split_set.setSizes([470, 360, 440])
+        return self.split_set
 
     def _build_behavior_card(self, layout):
         self.chk_paste = QCheckBox("粘贴发送内容（Ctrl+V）")
@@ -1529,11 +1590,16 @@ class MainWindow(QMainWindow):
         self.chk_paste.toggled.connect(self._on_ui_changed_for_save)
         layout.addWidget(self.chk_paste)
 
-        self.chk_lock_input = QCheckBox("发送前锁定鼠标键盘约 1 秒（避免与手动操作冲突）")
+        self.chk_lock_input = QCheckBox("发送前锁定鼠标键盘约 1 秒")
         self.chk_lock_input.setChecked(True)
-        self.chk_lock_input.setToolTip("需管理员权限；未提权时自动跳过，不影响正常发送")
+        self.chk_lock_input.setToolTip("发送前锁定真实鼠标键盘，避免与手动操作冲突；需管理员权限，未提权时自动跳过")
         self.chk_lock_input.toggled.connect(self._on_ui_changed_for_save)
         layout.addWidget(self.chk_lock_input)
+
+        perm_tip = QLabel("目标窗口为管理员权限时，本程序也需提权，否则键鼠消息会被拦截。")
+        perm_tip.setProperty("class", "hint")
+        perm_tip.setWordWrap(True)
+        layout.addWidget(perm_tip)
 
         # 按键序列：粘贴完成后依次发送
         key_head = QHBoxLayout()
@@ -1570,11 +1636,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lbl_key_empty)
         self.key_steps = []
         self._add_key_step('enter', 0)          # 默认回车，与旧版行为一致
-
-        tip = QLabel("目标窗口若以管理员身份运行，本程序也需以管理员运行，否则键鼠消息会被系统拦截。")
-        tip.setProperty("class", "hint")
-        tip.setWordWrap(True)
-        layout.addWidget(tip)
 
     def _build_action_bar(self):
         bar = QFrame()
@@ -1636,14 +1697,18 @@ class MainWindow(QMainWindow):
         return panel
 
     def _toggle_log(self):
+        """展开 / 收起运行日志：收起时整块隐藏，展开时给它固定高度，其余两段按原比例分。"""
         self._log_visible = not self._log_visible
-        self.log_view.setVisible(self._log_visible)
+        self.log_panel.setVisible(self._log_visible)
         self.btn_log_toggle.setText(("▾  " if self._log_visible else "▸  ") + "运行日志")
         sizes = self.split_v.sizes()
-        if self._log_visible:
-            self.split_v.setSizes([max(360, sum(sizes) - 130), 130])
-        else:
-            self.split_v.setSizes([max(400, sum(sizes) - 34), 34])
+        if self._log_visible and len(sizes) == 3:
+            total = sum(sizes) or 1
+            log_h = min(200, max(90, int(total * 0.18)))
+            rest = max(2, total - log_h)
+            head, body = max(1, sizes[0]), max(1, sizes[1])
+            keep = head + body
+            self.split_v.setSizes([int(rest * head / keep), int(rest * body / keep), log_h])
 
     def _collapsible_section(self, title, tip):
         """可折叠区块：返回 (容器, 内容布局, 标题按钮, 内容控件)。"""
@@ -1701,12 +1766,16 @@ class MainWindow(QMainWindow):
             geo = s.value('geometry')
             if geo is not None:
                 self.restoreGeometry(geo)
-            sizes_h = s.value('split_h')
-            if sizes_h and len(sizes_h) == 2:
-                self.split_h.setSizes([int(x) for x in sizes_h])
             sizes_v = s.value('split_v')
-            if sizes_v and len(sizes_v) == 2:
-                self.split_v.setSizes([int(x) for x in sizes_v])
+            if sizes_v:
+                sizes = [int(x) for x in sizes_v]
+                if len(sizes) == len(self.split_v.sizes()) and sum(sizes) > 0:
+                    self.split_v.setSizes(sizes)
+            sizes_s = s.value('split_set')
+            if sizes_s:
+                sizes = [int(x) for x in sizes_s]
+                if len(sizes) == len(self.split_set.sizes()) and sum(sizes) > 0:
+                    self.split_set.setSizes(sizes)
             log_visible = s.value('log_visible')
             if log_visible is not None and str(log_visible).lower() in ('false', '0'):
                 self._toggle_log()      # 上次为收起态：沿用收起外观，避免日志被压成细条
@@ -1724,8 +1793,8 @@ class MainWindow(QMainWindow):
         try:
             s = self._ui_settings()
             s.setValue('geometry', self.saveGeometry())
-            s.setValue('split_h', self.split_h.sizes())
             s.setValue('split_v', self.split_v.sizes())
+            s.setValue('split_set', self.split_set.sizes())
             s.setValue('log_visible', self._log_visible)
         except Exception:
             pass
@@ -1809,6 +1878,18 @@ class MainWindow(QMainWindow):
     # ── 步骤序列编辑（点击序列 / 按键序列） ──────────────────
 
     @staticmethod
+    def _labeled_row(label_text, widget, label_width=34):
+        """「标签 + 控件」单行，标签定宽，控件占满剩余宽度。"""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        lbl = QLabel(label_text)
+        lbl.setProperty("class", "hint")
+        lbl.setFixedWidth(label_width)
+        row.addWidget(lbl)
+        row.addWidget(widget, 1)
+        return row
+
+    @staticmethod
     def _step_row():
         """一个步骤行的容器与布局。"""
         frame = QFrame()
@@ -1821,6 +1902,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _step_buttons(row, entry, on_up, on_down, on_del):
         """步骤行尾部的上移 / 下移 / 删除按钮（闭包捕获 entry 字典本体）。"""
+        row.addStretch()
         for text, tip, slot, cls in (
             ("↑", "上移（越靠前越先执行）", lambda: on_up(entry), "btn-step"),
             ("↓", "下移（越靠后越晚执行）", lambda: on_down(entry), "btn-step"),
@@ -1850,30 +1932,26 @@ class MainWindow(QMainWindow):
         num = QLabel("")
         num.setFixedWidth(16)
         num.setProperty("class", "meta")
-        # 坐标由准星捕获或直接输入，不需要步进箭头；去掉箭头才能完整显示五位坐标
         sp_x = QSpinBox()
         sp_x.setRange(-32767, 32767)
         sp_x.setPrefix("X ")
         sp_x.setValue(int(x))
         sp_x.setMinimumWidth(78)
-        sp_x.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         sp_y = QSpinBox()
         sp_y.setRange(-32767, 32767)
         sp_y.setPrefix("Y ")
         sp_y.setValue(int(y))
         sp_y.setMinimumWidth(78)
-        sp_y.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         sp_d = QSpinBox()
         sp_d.setRange(0, 3600000)
         sp_d.setSuffix(" ms")
         sp_d.setValue(int(delay_ms))
-        sp_d.setMinimumWidth(86)
-        sp_d.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        sp_d.setMinimumWidth(88)
         sp_d.setToolTip("执行这个点击点之前等待的时长（毫秒）")
 
         row.addWidget(num)
-        row.addWidget(sp_x, 1)
-        row.addWidget(sp_y, 1)
+        row.addWidget(sp_x)
+        row.addWidget(sp_y)
         row.addWidget(sp_d)
         self._step_buttons(
             row, entry,
@@ -1900,18 +1978,17 @@ class MainWindow(QMainWindow):
         num.setProperty("class", "meta")
         edit = QLineEdit(str(key))
         edit.setPlaceholderText("如 Enter / Tab / Ctrl+A / F5")
-        edit.setMinimumWidth(92)
+        edit.setMinimumWidth(130)
         edit.setToolTip("单个按键或组合键（用 + 连接表示同时按下）")
         sp_d = QSpinBox()
         sp_d.setRange(0, 3600000)
         sp_d.setSuffix(" ms")
         sp_d.setValue(int(delay_ms))
-        sp_d.setMinimumWidth(86)
-        sp_d.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        sp_d.setMinimumWidth(92)
         sp_d.setToolTip("发送这个按键之前等待的时长（毫秒）")
 
         row.addWidget(num)
-        row.addWidget(edit, 1)
+        row.addWidget(edit)
         row.addWidget(sp_d)
         self._step_buttons(
             row, entry,
@@ -2068,7 +2145,7 @@ class MainWindow(QMainWindow):
         self.split_prompt.addWidget(self.prompt_edit)
         self.split_prompt.setStretchFactor(0, 0)
         self.split_prompt.setStretchFactor(1, 1)
-        self.split_prompt.setSizes([260, 480])
+        self.split_prompt.setSizes([300, 860])
         layout.addWidget(self.split_prompt, 1)
 
         # ── 附加前言（可选，折叠） ──
@@ -2140,10 +2217,10 @@ class MainWindow(QMainWindow):
         seg_row.addWidget(self.btn_seg_loop)
 
         # 「获取此时」：把当前激活面板的触发时间设为按下这一刻
-        self.btn_get_now = QPushButton("🕐 获取此时")
+        self.btn_get_now = QPushButton("🕐 此时")
         self.btn_get_now.setProperty("class", "btn-now")
         self.btn_get_now.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_get_now.setToolTip("把触发时间设为按下按钮的当前时刻")
+        self.btn_get_now.setToolTip("把当前激活面板的触发时间设为按下按钮的当前时刻")
         self.btn_get_now.clicked.connect(self._apply_now_time)
         seg_row.addSpacing(8)
         seg_row.addWidget(self.btn_get_now)
@@ -2151,11 +2228,11 @@ class MainWindow(QMainWindow):
         seg_row.addStretch()
         layout.addLayout(seg_row)
 
-        # —— 单次面板 ——
+        # —— 单次面板（竖排） ——
         self.single_panel = QWidget()
         sp = QVBoxLayout(self.single_panel)
         sp.setContentsMargins(2, 6, 2, 4)
-        sp.setSpacing(10)
+        sp.setSpacing(6)
 
         label1 = QLabel("触发时间")
         label1.setStyleSheet("color: #7a93c0; font-size: 9pt; font-weight: 500;")
@@ -2164,56 +2241,51 @@ class MainWindow(QMainWindow):
         self.single_dt = QDateTimeEdit(QDateTime.currentDateTime().addSecs(60))
         self.single_dt.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
         self.single_dt.setCalendarPopup(True)
-        self.single_dt.setMinimumHeight(30)
+        self.single_dt.setMinimumHeight(36)
+        self.single_dt.setStyleSheet("QDateTimeEdit { font-size: 12pt; font-weight: 600; }")
         sp.addWidget(self.single_dt)
 
         s_hint = QLabel("到点自动发送一次，然后停止")
-        s_hint.setStyleSheet("color: #5a7ab0; font-size: 8.5pt;")
-        s_hint.setWordWrap(True)
+        s_hint.setProperty("class", "hint")
         sp.addWidget(s_hint)
 
         layout.addWidget(self.single_panel)
 
-        # —— 循环面板 ——
+        # —— 循环面板（竖排：开始 / 结束 / 间隔 + 立即首发） ——
         self.loop_panel = QWidget()
         lp = QVBoxLayout(self.loop_panel)
         lp.setContentsMargins(2, 6, 2, 4)
-        lp.setSpacing(2)   # 三行紧凑，行间距接近 0，把高度让给下方预览列表
+        lp.setSpacing(6)
 
-        # 开始
         self.loop_start_dt = QDateTimeEdit(QDateTime.currentDateTime().addSecs(60))
         self.loop_start_dt.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
         self.loop_start_dt.setCalendarPopup(True)
-        self.loop_start_dt.setMinimumHeight(42)
-        self.loop_start_dt.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.loop_start_dt.setMinimumHeight(36)
         self.loop_start_dt.setStyleSheet("QDateTimeEdit { font-size: 12pt; font-weight: 600; }")
-        lp.addWidget(self.loop_start_dt)
+        lp.addLayout(self._labeled_row("开始", self.loop_start_dt))
 
-        # 结束
         self.loop_end_dt = QDateTimeEdit(QDateTime.currentDateTime().addDays(7))
         self.loop_end_dt.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
         self.loop_end_dt.setCalendarPopup(True)
-        self.loop_end_dt.setMinimumHeight(42)
-        self.loop_end_dt.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.loop_end_dt.setMinimumHeight(36)
         self.loop_end_dt.setStyleSheet("QDateTimeEdit { font-size: 12pt; font-weight: 600; }")
-        lp.addWidget(self.loop_end_dt)
+        lp.addLayout(self._labeled_row("结束", self.loop_end_dt))
 
-        # 间隔 + 立即
         opt_row = QHBoxLayout()
-        opt_row.setSpacing(8)
-        opt_row.addWidget(QLabel("间隔:"))
+        opt_row.setSpacing(6)
+        opt_row.addWidget(QLabel("间隔"))
         self.spin_interval = QSpinBox()
         self.spin_interval.setRange(1, 1440)
         self.spin_interval.setValue(10)
         self.spin_interval.setSuffix(" 分钟")
-        self.spin_interval.setMinimumHeight(42)
-        self.spin_interval.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.spin_interval.setMinimumHeight(36)
+        self.spin_interval.setMinimumWidth(110)
         self.spin_interval.setStyleSheet("QSpinBox { font-size: 12pt; font-weight: 600; }")
-        opt_row.addWidget(self.spin_interval)
-        opt_row.addSpacing(12)
-        self.chk_immediate = QCheckBox("启动时立即发第 1 次")
+        opt_row.addWidget(self.spin_interval, 1)
+
+        self.chk_immediate = QCheckBox("立即发第 1 次")
+        self.chk_immediate.setToolTip("启动后不等开始时间，立刻先发一次")
         opt_row.addWidget(self.chk_immediate)
-        opt_row.addStretch()
         lp.addLayout(opt_row)
 
         layout.addWidget(self.loop_panel)
@@ -2230,8 +2302,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(pv_title)
 
         self.list_schedule = QListWidget()
-        # 预览列表吸收循环设置三行紧凑后让出的垂直空间
-        self.list_schedule.setMinimumHeight(76)
+        # 全宽后预览列表可多显示几行
+        self.list_schedule.setMinimumHeight(118)
         self.list_schedule.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         # 触发时间条目宽度不参与 sizeHint，超长时省略号截断，避免撑宽左栏
         self.list_schedule.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -3200,7 +3272,7 @@ if __name__ == '__main__':
         instance_name = ''
 
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
+    app.setStyle(CheckIndicatorStyle(QStyleFactory.create('Fusion')))
     font = QFont("Microsoft YaHei UI", 9)
     app.setFont(font)
     win = MainWindow(instance_name)
