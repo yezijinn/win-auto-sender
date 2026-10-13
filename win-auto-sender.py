@@ -32,7 +32,7 @@ except Exception:
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QPushButton, QSpinBox, QMessageBox,
+    QLabel, QComboBox, QPushButton, QSpinBox, QMessageBox, QGridLayout,
     QListWidget, QListWidgetItem, QScrollArea, QPlainTextEdit,
     QDateTimeEdit, QCheckBox, QFrame, QSizePolicy, QSplitter,
     QTextEdit, QButtonGroup, QFileDialog, QAbstractItemView, QLineEdit,
@@ -461,9 +461,13 @@ VK_NAME_MAP = {
     'semicolon': 0xBA, ';': 0xBA, 'quote': 0xDE, "'": 0xDE,
     'bracketleft': 0xDB, '[': 0xDB, 'bracketright': 0xDD, ']': 0xDD,
     'grave': 0xC0, '`': 0xC0,
+    # 小键盘（108 键盘数字区）
+    'multiply': 0x6A, 'add': 0x6B, 'subtract': 0x6D, 'divide': 0x6F, 'decimal': 0x6E,
 }
 for _n in range(1, 25):
     VK_NAME_MAP['f%d' % _n] = 0x6F + _n        # VK_F1 = 0x70
+for _i in range(10):
+    VK_NAME_MAP['numpad%d' % _i] = 0x60 + _i   # VK_NUMPAD0 = 0x60
 
 
 def parse_key_combo(text):
@@ -1544,6 +1548,50 @@ QPushButton[class="mini-stop"] {
 QPushButton[class="mini-stop"]:hover { background-color: #73283d; }
 """
 
+VKBD_STYLE = """
+/* ═════════  虚拟键盘（悬浮 108 键盘）  ═════════ */
+QWidget {
+    font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+    color: #d6e4ff;
+}
+QWidget#vkbdRoot {
+    background-color: #0e1a2e;
+    border: 1px solid #2b4a7d;
+}
+QLabel { background: transparent; }
+QLabel[class="vkbd-title"] { font-size: 11pt; font-weight: 600; color: #e0eeff; }
+QLabel[class="vkbd-status"] {
+    font-size: 9pt; color: #a8d4ff;
+    background-color: #132347;
+    border: 1px solid #2b4a7d;
+    border-radius: 6px;
+    padding: 5px 10px;
+}
+QPushButton[class="vkbd-close"] {
+    background-color: #e5484d; color: #ffffff;
+    border: 1px solid #ff8a8f; border-radius: 6px;
+    font-size: 14pt; font-weight: 700;
+}
+QPushButton[class="vkbd-close"]:hover { background-color: #ff6169; border-color: #ffb0b4; }
+QPushButton[class="vkbd-close"]:pressed { background-color: #c93b40; border-color: #e5484d; }
+/* class 属性为 "vkbd-key" / "vkbd-key vkbd-key-mod" 多词值，须用 ~= 词匹配 */
+QPushButton[class~="vkbd-key"] {
+    background-color: #122038;
+    color: #d6e4ff;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+    font-size: 9pt;
+}
+QPushButton[class~="vkbd-key"]:hover { border-color: #00b8ff; color: #ffffff; }
+QPushButton[class~="vkbd-key"]:pressed { background-color: #0a2f4a; color: #ffffff; }
+QPushButton[class~="vkbd-key"]:checked {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00b8ff, stop:1 #3d7bff);
+    color: #ffffff;
+    border-color: #00b8ff;
+}
+QPushButton[class~="vkbd-key-mod"] { color: #9fc2ff; }
+"""
+
 
 class MiniWindow(QWidget):
     """极简迷你窗口：只保留「改时间 / 改内容 / 启动-停止」三类交互。
@@ -1934,6 +1982,238 @@ class MiniWindow(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  虚拟键盘（悬浮 108 键盘）
+# ═══════════════════════════════════════════════════════════════
+
+class VirtualKeyboardDialog(QWidget):
+    """悬浮 108 键盘：点击按键即把键名写入目标输入框。
+
+    Ctrl / Shift / Alt / Win 为点亮式修饰键，先点亮再点普通按键即录入组合键
+    （如点亮 Ctrl 后点 A → 录入 Ctrl+A）；录入一次后修饰键自动复位。
+    """
+
+    U = 40          # 单位键宽（像素）
+    G = 4           # 键间距
+    H = 38          # 键高
+
+    MOD_ORDER = (('Ctrl', 'ctrl'), ('Shift', 'shift'), ('Alt', 'alt'), ('Win', 'win'))
+
+    # (标签, 录入键名, 宽度倍数)；标签为 None 表示占位空档
+    MAIN_ROWS = (
+        (('Esc', 'esc', 1), (None, None, 1), ('F1', 'f1', 1), ('F2', 'f2', 1), ('F3', 'f3', 1),
+         ('F4', 'f4', 1), (None, None, 0.5), ('F5', 'f5', 1), ('F6', 'f6', 1), ('F7', 'f7', 1),
+         ('F8', 'f8', 1), (None, None, 0.5), ('F9', 'f9', 1), ('F10', 'f10', 1), ('F11', 'f11', 1),
+         ('F12', 'f12', 1)),
+        (('`', 'grave', 1), ('1', '1', 1), ('2', '2', 1), ('3', '3', 1), ('4', '4', 1), ('5', '5', 1),
+         ('6', '6', 1), ('7', '7', 1), ('8', '8', 1), ('9', '9', 1), ('0', '0', 1), ('-', 'minus', 1),
+         ('=', 'equal', 1), ('Backspace', 'backspace', 2)),
+        (('Tab', 'tab', 1.5), ('Q', 'q', 1), ('W', 'w', 1), ('E', 'e', 1), ('R', 'r', 1), ('T', 't', 1),
+         ('Y', 'y', 1), ('U', 'u', 1), ('I', 'i', 1), ('O', 'o', 1), ('P', 'p', 1),
+         ('[', 'bracketleft', 1), (']', 'bracketright', 1), ('\\', 'backslash', 1.5)),
+        (('CapsLock', 'capslock', 1.75), ('A', 'a', 1), ('S', 's', 1), ('D', 'd', 1), ('F', 'f', 1),
+         ('G', 'g', 1), ('H', 'h', 1), ('J', 'j', 1), ('K', 'k', 1), ('L', 'l', 1),
+         (';', 'semicolon', 1), ("'", 'quote', 1), ('Enter', 'enter', 2.25)),
+        (('Shift', 'shift', 2.25), ('Z', 'z', 1), ('X', 'x', 1), ('C', 'c', 1), ('V', 'v', 1),
+         ('B', 'b', 1), ('N', 'n', 1), ('M', 'm', 1), (',', 'comma', 1), ('.', 'period', 1),
+         ('/', 'slash', 1), ('Shift', 'shift', 2.75)),
+        (('Ctrl', 'ctrl', 1.25), ('Win', 'win', 1.25), ('Alt', 'alt', 1.25), ('Space', 'space', 6.25),
+         ('Alt', 'alt', 1.25), ('Win', 'win', 1.25), ('Menu', 'apps', 1.25), ('Ctrl', 'ctrl', 1.25)),
+    )
+    # 编辑区导航列（3 列 × 6 行），None 为占位
+    NAV_ROWS = (
+        (('PrtSc', 'printscreen'), ('ScrLk', 'scrolllock'), ('Pause', 'pause')),
+        (('Ins', 'insert'), ('Home', 'home'), ('PgUp', 'pageup')),
+        (('Del', 'delete'), ('End', 'end'), ('PgDn', 'pagedown')),
+        (None, None, None),
+        (None, ('↑', 'up'), None),
+        (('←', 'left'), ('↓', 'down'), ('→', 'right')),
+    )
+    # 小键盘： (行, 列, 跨行, 跨列, (标签, 键名))
+    PAD_KEYS = (
+        (0, 0, 1, 1, ('NumLk', 'numlock')), (0, 1, 1, 1, ('/', 'divide')),
+        (0, 2, 1, 1, ('*', 'multiply')), (0, 3, 1, 1, ('-', 'subtract')),
+        (1, 0, 1, 1, ('7', 'numpad7')), (1, 1, 1, 1, ('8', 'numpad8')),
+        (1, 2, 1, 1, ('9', 'numpad9')), (1, 3, 2, 1, ('+', 'add')),
+        (2, 0, 1, 1, ('4', 'numpad4')), (2, 1, 1, 1, ('5', 'numpad5')),
+        (2, 2, 1, 1, ('6', 'numpad6')),
+        (3, 0, 1, 1, ('1', 'numpad1')), (3, 1, 1, 1, ('2', 'numpad2')),
+        (3, 2, 1, 1, ('3', 'numpad3')), (3, 3, 2, 1, ('Enter', 'enter')),
+        (4, 0, 1, 2, ('0', 'numpad0')), (4, 2, 1, 1, ('.', 'decimal')),
+    )
+
+    def __init__(self, main):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.main = main
+        self._target = None                       # 当前录入目标输入框
+        self._drag_from = None
+        self._mod_groups = {name: [] for _, name in self.MOD_ORDER}
+
+        self.setObjectName("vkbdRoot")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setWindowTitle("虚拟键盘")
+        self.setStyleSheet(VKBD_STYLE)
+
+        self._build_ui()
+
+    # ── 界面 ────────────────────────────────────────────────
+
+    def _build_ui(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 8, 12, 12)
+        v.setSpacing(8)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        title = QLabel("⌨  虚拟键盘")
+        title.setProperty("class", "vkbd-title")
+        top.addWidget(title)
+        top.addStretch()
+        btn_close = QPushButton("✕")
+        btn_close.setProperty("class", "vkbd-close")
+        btn_close.setFixedSize(30, 30)
+        btn_close.setToolTip("关闭虚拟键盘")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(self.hide)
+        top.addWidget(btn_close)
+        v.addLayout(top)
+
+        self._combo_lbl = QLabel()
+        self._combo_lbl.setProperty("class", "vkbd-status")
+        self._combo_lbl.setMinimumHeight(28)
+        v.addWidget(self._combo_lbl)
+        self._refresh_combo_label()
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+
+        main_col = QVBoxLayout()
+        main_col.setSpacing(self.G)
+        for row_def in self.MAIN_ROWS:
+            row = QHBoxLayout()
+            row.setSpacing(self.G)
+            for label, name, units in row_def:
+                if label is None:
+                    spacer = QWidget()
+                    spacer.setFixedSize(self._w(units), 1)
+                    row.addWidget(spacer)
+                else:
+                    row.addWidget(self._make_key(label, name, self._w(units)))
+            main_col.addLayout(row)
+        body.addLayout(main_col)
+
+        nav = QGridLayout()
+        nav.setSpacing(self.G)
+        for r, row_def in enumerate(self.NAV_ROWS):
+            for c, cell in enumerate(row_def):
+                if cell is None:
+                    filler = QWidget()
+                    filler.setFixedSize(self.U, self.H)
+                    nav.addWidget(filler, r, c)
+                else:
+                    nav.addWidget(self._make_key(cell[0], cell[1], self.U), r, c)
+        body.addLayout(nav)
+
+        pad = QGridLayout()
+        pad.setSpacing(self.G)
+        for r, c, rs, cs, (label, name) in self.PAD_KEYS:
+            w = self.U * cs + self.G * (cs - 1)
+            h = self.H * rs + self.G * (rs - 1)
+            pad.addWidget(self._make_key(label, name, w, h), r, c, rs, cs)
+        body.addLayout(pad)
+
+        v.addLayout(body)
+
+    def _w(self, units):
+        """按键宽度：按倍数换算像素（含键间距补偿）。"""
+        return int(round(units * self.U + max(0.0, units - 1) * self.G))
+
+    def _make_key(self, label, name, w, h=None):
+        btn = QPushButton(label)
+        btn.setFixedSize(w, self.H if h is None else h)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        if name in self._mod_groups:
+            btn.setProperty("class", "vkbd-key vkbd-key-mod")
+            btn.setCheckable(True)
+            btn.setToolTip("组合键修饰：点亮后点普通按键即录入组合键")
+            self._mod_groups[name].append(btn)
+            btn.clicked.connect(lambda _=False, b=btn, n=name: self._set_mod_state(n, b.isChecked()))
+        else:
+            btn.setProperty("class", "vkbd-key")
+            btn.setToolTip("点击录入 %s" % name)
+            btn.clicked.connect(lambda _=False, n=name: self._on_key(n))
+        return btn
+
+    # ── 录入逻辑 ────────────────────────────────────────────
+
+    def set_target(self, edit):
+        """把录入目标切换到某一行按键输入框。"""
+        self._target = edit
+
+    def _set_mod_state(self, name, checked):
+        """左右两侧同名修饰键状态联动。"""
+        for btn in self._mod_groups[name]:
+            btn.setChecked(checked)
+        self._refresh_combo_label()
+
+    def _refresh_combo_label(self, recorded=None):
+        """状态条：修饰键点亮时提示组合进行中，录入后回显最近一次结果。"""
+        if recorded:
+            self._combo_lbl.setText("已录入：%s" % recorded)
+            return
+        lit = [label for label, key in self.MOD_ORDER
+               if any(b.isChecked() for b in self._mod_groups[key])]
+        if lit:
+            self._combo_lbl.setText("组合进行中：%s ＋ 点击一个按键完成录入" % '+'.join(lit))
+        else:
+            self._combo_lbl.setText("点击按键即录入单键；组合键：先点亮 Ctrl / Shift / Alt / Win 再点按键")
+
+    def _on_key(self, name):
+        if self._target is None:
+            return
+        parts = [label for label, key in self.MOD_ORDER
+                 if any(b.isChecked() for b in self._mod_groups[key])]
+        # 单字母与 F 键用大写写法（Ctrl+A / F5），其余沿用规范小写键名（enter / pageup）
+        if (len(name) == 1 and name.isalpha()) or (name.startswith('f') and name[1:].isdigit()):
+            name = name.upper()
+        parts.append(name)
+        combo = '+'.join(parts)
+        try:
+            self._target.setText(combo)
+        except RuntimeError:      # 目标步骤行已删除，输入框随之销毁
+            self._target = None
+            self._refresh_combo_label()
+            return
+        for _, key in self.MOD_ORDER:     # 录入后复位修饰键，便于连续录入
+            self._set_mod_state(key, False)
+        self._refresh_combo_label(combo)
+
+    # ── 拖动（无边框窗口） ──────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton \
+                and not isinstance(self.childAt(event.position().toPoint()), QPushButton):
+            self._drag_from = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_from is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.move(event.globalPosition().toPoint() - self._drag_from)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_from is not None:
+            self._drag_from = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  主窗口
 # ═══════════════════════════════════════════════════════════════
 
@@ -1947,6 +2227,7 @@ class MainWindow(QMainWindow):
 
         self._section_heads = {}       # 折叠分区索引：key -> (标题按钮, 标题基名)
         self._mini = None              # 迷你窗口（按需创建）
+        self._vkbd = None              # 虚拟键盘（按需创建）
         self._mini_state = None        # 上次迷你窗口状态（几何/停靠边/收起态）
         self._is_default_window = not instance_name   # 无 --name 启动：首次默认窗口
         self.worker = None
@@ -2206,6 +2487,24 @@ class MainWindow(QMainWindow):
         """工具栏「＋ 添加」：先展开分区再新增步骤，避免新步骤落在收起区里看不见。"""
         self._expand_section('keys')
         self._add_key_step()
+
+    def _open_virtual_keyboard(self, edit):
+        """悬浮虚拟键盘：点击的按键直接写入该步骤的输入框。"""
+        if self._vkbd is None:
+            self._vkbd = VirtualKeyboardDialog(self)
+            self._vkbd.adjustSize()
+        self._vkbd.set_target(edit)
+        if not self._vkbd.isVisible():
+            geo = self.frameGeometry()
+            scr = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+            x = min(max(geo.center().x() - self._vkbd.width() // 2, scr.left() + 8),
+                    scr.right() - self._vkbd.width() - 8)
+            y = min(max(geo.center().y() - self._vkbd.height() // 2, scr.top() + 8),
+                    scr.bottom() - self._vkbd.height() - 8)
+            self._vkbd.move(x, y)
+        self._vkbd.show()
+        self._vkbd.raise_()
+        self._vkbd.activateWindow()
 
     def _build_action_bar(self):
         bar = QFrame()
@@ -2631,8 +2930,16 @@ class MainWindow(QMainWindow):
         sp_d.setToolTip("发送这个按键之前等待的时长（毫秒）")
         self._guard_wheel(sp_d)
 
+        btn_kb = QPushButton("⌨")
+        btn_kb.setProperty("class", "btn-step")
+        btn_kb.setFixedSize(22, 22)
+        btn_kb.setToolTip("打开虚拟键盘，点击按键直接录入")
+        btn_kb.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_kb.clicked.connect(lambda: self._open_virtual_keyboard(edit))
+
         row.addWidget(num)
         row.addWidget(edit)
+        row.addWidget(btn_kb)
         row.addWidget(sp_d)
         self._step_buttons(
             row, entry,
@@ -3999,6 +4306,9 @@ class MainWindow(QMainWindow):
             self._closing = False       # 用户选择"取消关闭"：恢复界面可操作
             self._set_closing_ui(False)
             return
+        if self._vkbd is not None:
+            self._vkbd.close()
+            self._vkbd = None
         if self._mini is not None:
             mini = self._mini
             self._save_ui_state()       # 先落盘迷你窗口几何/停靠态，再关闭

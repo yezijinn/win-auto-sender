@@ -28,7 +28,7 @@ Works against targets such as OpenCode, VS Code, Windows Terminal, CMD and brows
 |---|---|
 | 🎯 **Crosshair Drag-To-Aim** | Spy++-style: drag the crosshair onto the target input box and release to bind the window and append that point as a click step |
 | 🖱️ **Click Sequence** | Multiple click points per target, executed in order: custom coordinates (negative coordinates for secondary monitors supported), reorderable (drag / ↑↓) and a **per-step delay in ms** (new steps default to 1000 ms) |
-| ⌨️ **Key Sequence** | Keys sent after pasting: `Enter` / `Tab` / `Esc` / `F1`–`F12` / `Ctrl+A` and other single or combined keys, each with its **own delay** (new steps default to 1000 ms) |
+| ⌨️ **Key Sequence** | Keys sent after pasting: `Enter` / `Tab` / `Esc` / `F1`–`F12` / `Ctrl+A` and other single or combined keys, each with its **own delay** (new steps default to 1000 ms); the **⌨** button on a step opens a floating full-size keyboard for click-to-enter (numpad and nav keys included; light up Ctrl/Shift/Alt/Win first to record a combo) |
 | 📋 **Paste Switch** | Turn the `Ctrl+V` paste off to send only keystrokes (e.g. shortcut-only actions) |
 | 🧲 **Bypass Focus-Stealing Protection** | `AttachThreadInput` + keyboard-state simulation to overcome background-focus restrictions |
 | 🖥️ **High-DPI Aware** | Native `SetProcessDpiAwareness` — coordinates stay correct at 2K/4K and 125%/150% scaling |
@@ -94,7 +94,7 @@ The settings area holds three side-by-side columns (draggable widths, each colum
 1. **Bind window and click points**: press and hold the **🎯 crosshair** in the settings area, drag to the target input area and release — the window is bound and that point is **appended** as a click step. Repeat to click several places (input box → send button), then reorder with **↑/↓** and set a **delay (ms)** per step. With no click point at all the tool only foregrounds the window.
 2. **Enter prompts**: click **➕ Add** in the content area, then write in the editor (multi-line supported); reorder with **⬆/⬇** or by dragging the list items; optionally fill **[Preface]** / **[Suffix]**.
 3. **Set trigger**: single fires at a chosen time; loop sets a minute interval, optional immediate first fire and start/end dates, with a live preview of the next fire times.
-4. **Configure send behaviour**: decide whether to **paste the content (Ctrl+V)** and edit the **key sequence** — one `Enter` by default, replaceable with `Tab`, `F5`, `Ctrl+A` and other single or combined keys, each with its own delay.
+4. **Configure send behaviour**: decide whether to **paste the content (Ctrl+V)** and edit the **key sequence** — one `Enter` by default, replaceable with `Tab`, `F5`, `Ctrl+A` and other single or combined keys, each with its own delay; if unsure of a key name, click the **⌨** button on the step and click keys on the floating full-size keyboard — for combos, light up Ctrl/Shift/Alt/Win first, then click the target key.
 5. **Test, then run**: click **⚡ Test Send** first to confirm focus, clicks, paste and keys all land correctly, then **▶ Start** to keep it running.
 
 ---
