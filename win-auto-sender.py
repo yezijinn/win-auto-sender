@@ -37,13 +37,14 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QScrollArea, QPlainTextEdit,
     QDateTimeEdit, QCheckBox, QFrame, QSizePolicy, QSplitter,
     QTextEdit, QButtonGroup, QFileDialog, QAbstractItemView, QLineEdit,
-    QProxyStyle, QStyle, QStyleFactory
+    QProxyStyle, QStyle, QStyleFactory, QAbstractScrollArea
 )
 from PySide6.QtCore import (
-    Qt, QDateTime, QThread, Signal, QTimer, QFileSystemWatcher, QSettings, QPointF, QRectF
+    Qt, QDateTime, QThread, Signal, QTimer, QFileSystemWatcher, QSettings,
+    QPointF, QRectF, QObject, QEvent
 )
 from PySide6.QtGui import (
-    QFont, QCursor, QPainter, QPen, QColor, QKeyEvent, QBrush, QLinearGradient
+    QFont, QCursor, QPainter, QPen, QColor, QKeyEvent, QBrush, QLinearGradient, QWheelEvent
 )
 
 user32 = ctypes.windll.user32
@@ -140,9 +141,27 @@ def _decode_prompts(parser):
     return split_prompt_text(raw)
 
 
+def _coerce_step_int(value, lo, hi, field, warnings):
+    """把步骤字段收敛为 [lo, hi] 内的整数：无法解析按 0、越界夹紧，两种情况都记一条告警。"""
+    try:
+        num = float(value)
+        if num != num:                      # NaN
+            raise ValueError('nan')
+        iv = int(num)
+    except Exception:
+        warnings.append("%s 无法解析（%r），已按 0 处理" % (field, value))
+        return 0
+    if iv < lo or iv > hi:
+        clamped = max(lo, min(hi, iv))
+        warnings.append("%s 超出范围（%r），已按 %d 处理" % (field, value, clamped))
+        return clamped
+    return iv
+
+
 def load_config_file(path=None):
     """从 ini 读取配置，返回 dict。文件不存在或无内容则返回默认。"""
     path = path or default_config_file()
+    load_warnings = []              # 加载期自动修正过的字段，交给界面写进运行日志
     cfg = {
         'mode': 'single',
         'strategy': 'sequence',
@@ -161,7 +180,7 @@ def load_config_file(path=None):
         'lock_input': True,
         'paste': True,
         'click_steps': [],          # [{'x': int, 'y': int, 'delay_ms': int}, ...]
-        'key_steps': [],            # [{'key': 'enter', 'delay_ms': int}, ...]
+        'key_steps': None,          # None = 键不存在（旧配置，用默认回车）；[] = 用户明确清空
         'prompts': [],
     }
     if not os.path.exists(path):
@@ -175,8 +194,13 @@ def load_config_file(path=None):
             parser = configparser.ConfigParser(interpolation=None)
             parser.read(path, encoding='gbk')
         except Exception:
+            cfg['load_warnings'] = ["配置文件的编码无法识别（既不是 UTF-8 也不是 GBK），"
+                                    "已按默认配置打开；原文件未被改写"]
             return cfg
     except Exception:
+        # 语法错误等：保留提示，避免用户以为"配置莫名其妙全空了"还把它写回去
+        cfg['load_warnings'] = ["配置文件解析失败，已按默认配置打开；"
+                                "原文件未被改写，请检查该 ini 的语法"]
         return cfg
 
     if parser.has_section('general'):
@@ -206,36 +230,42 @@ def load_config_file(path=None):
         if 'paste' in g:
             val = g['paste'].strip().strip('"').lower()
             cfg['paste'] = val in ('true', '1', 'yes', 'on')
-        # 点击序列 / 按键序列：单行 JSON 数组，逐项做类型收敛，坏项直接丢弃
+        # 点击序列 / 按键序列：单行 JSON 数组。逐字段做类型收敛：坏字段按默认值处理
+        # 并记入 load_warnings，整项只有在"不是对象"或"按键名为空"时才丢弃，
+        # 避免一个写坏的字段把同一行里其它有效设置一起带走。
         for key in ('click_steps', 'key_steps'):
             if key not in g or not g[key].strip():
                 continue
             try:
                 data = json.loads(g[key].strip().strip('"'))
             except Exception:
+                load_warnings.append("%s 不是合法 JSON，已忽略该字段" % key)
                 continue
             if not isinstance(data, list):
+                load_warnings.append("%s 不是数组，已忽略该字段" % key)
                 continue
             steps = []
-            for item in data:
+            for pos, item in enumerate(data, 1):
                 if not isinstance(item, dict):
+                    load_warnings.append("%s 第 %d 项不是对象，已丢弃" % (key, pos))
                     continue
-                try:
-                    delay = max(0, min(3600000, int(float(item.get('delay_ms', 0)))))
-                except Exception:
-                    delay = 0
+                delay = _coerce_step_int(item.get('delay_ms', 0), 0, 3600000,
+                                         "%s 第 %d 项延时" % (key, pos), load_warnings)
                 if key == 'click_steps':
-                    try:
-                        steps.append({'x': max(-32767, min(32767, int(float(item.get('x', 0))))),
-                                      'y': max(-32767, min(32767, int(float(item.get('y', 0))))),
-                                      'delay_ms': delay})
-                    except Exception:
-                        continue
+                    x = _coerce_step_int(item.get('x', 0), -32767, 32767,
+                                         "%s 第 %d 项 X" % (key, pos), load_warnings)
+                    y = _coerce_step_int(item.get('y', 0), -32767, 32767,
+                                         "%s 第 %d 项 Y" % (key, pos), load_warnings)
+                    steps.append({'x': x, 'y': y, 'delay_ms': delay})
                 else:
-                    name = str(item.get('key', '')).strip()
-                    if name:
-                        steps.append({'key': name, 'delay_ms': delay})
+                    name = str(item.get('key') or '').strip()
+                    if not name:
+                        load_warnings.append("%s 第 %d 项缺少按键名，已丢弃" % (key, pos))
+                        continue
+                    steps.append({'key': name, 'delay_ms': delay})
             cfg[key] = steps
+        if load_warnings:
+            cfg['load_warnings'] = load_warnings
         for key in ('window_title',):
             if key in g and g[key].strip():
                 cfg[key] = g[key].strip().strip('"')
@@ -341,8 +371,13 @@ def is_admin():
         return False
 
 
-def force_foreground_window(hwnd):
-    """突破限制激活窗口焦点"""
+def force_foreground_window(hwnd, verify_seconds=0.8):
+    """突破限制激活窗口焦点。
+
+    返回值语义：目标窗口是否**确认**成为前台窗口。SetForegroundWindow 的返回值受
+    系统前台策略影响、且前台切换是异步的，所以用 GetForegroundWindow 短轮询复核；
+    只有整个窗口期内都没切过去才算失败，避免即时比对造成的高频误报。
+    """
     if not hwnd or not win32gui.IsWindow(hwnd):
         return False
     if win32gui.IsIconic(hwnd):
@@ -350,24 +385,27 @@ def force_foreground_window(hwnd):
     current_tid = kernel32.GetCurrentThreadId()
     target_tid, _ = win32process.GetWindowThreadProcessId(hwnd)
     attached = False
-    ok_fore = False
-    if current_tid != target_tid:
-        attached = bool(user32.AttachThreadInput(current_tid, target_tid, True))
     try:
+        if current_tid != target_tid:
+            attached = bool(user32.AttachThreadInput(current_tid, target_tid, True))
         win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
         win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
-        ok_fore = bool(user32.SetForegroundWindow(hwnd))
+        user32.SetForegroundWindow(hwnd)
         user32.BringWindowToTop(hwnd)
         user32.SetActiveWindow(hwnd)
+        deadline = time.time() + max(0.0, verify_seconds)
+        while True:
+            if user32.GetForegroundWindow() == hwnd:
+                time.sleep(0.15)      # 前台落定后再交给调用方
+                return True
+            if time.time() >= deadline:
+                break
+            time.sleep(0.05)
+        print("[提示] 未能把目标窗口切到前台（可能被系统前台策略或其它程序占用）。")
+        return False
     finally:
         if attached:
             user32.AttachThreadInput(current_tid, target_tid, False)
-    time.sleep(0.15)
-    # 仅以 SetForegroundWindow 返回值提示；不额外做 GetForegroundWindow 即时比对，
-    # 因 Windows 前台切入为异步，即时比对会因窗口尚未落定而高频误报
-    if not ok_fore:
-        print("[提示] SetForegroundWindow 返回失败（可能受系统前台限制），发送将照常尝试；若落点异常请确认目标窗口权限。")
-    return True
 
 
 # 跨实例发送互斥锁：同一时刻只允许一个实例执行发送关键段，规避多开冲突
@@ -392,6 +430,7 @@ VK_NAME_MAP = {
     'capslock': 0x14, 'numlock': 0x90, 'scrolllock': 0x91,
     'printscreen': 0x2C, 'pause': 0x13,
     'minus': 0xBD, '-': 0xBD, 'equal': 0xBB, '=': 0xBB,
+    'plus': 0xBB, '加号': 0xBB,      # 与 '=' 同键位（US 布局下需要 Shift 才是字面 '+'）
     'comma': 0xBC, ',': 0xBC, 'period': 0xBE, '.': 0xBE,
     'slash': 0xBF, '/': 0xBF, 'backslash': 0xDC, '\\': 0xDC,
     'semicolon': 0xBA, ';': 0xBA, 'quote': 0xDE, "'": 0xDE,
@@ -403,8 +442,13 @@ for _n in range(1, 25):
 
 
 def parse_key_combo(text):
-    """把 'enter' / 'Ctrl+A' / 'F5' 解析为虚拟键码列表；无法识别返回 None。"""
-    parts = [p.strip() for p in str(text).replace('＋', '+').split('+') if p.strip()]
+    """把 'enter' / 'Ctrl+A' / 'F5' 解析为虚拟键码列表；无法识别返回 None。
+
+    分隔符与加号键同形：'Ctrl++' 末段的 '+' 表示字面加号键（等价写法 'Ctrl+plus'），
+    先规范成键名再按 '+' 切分，避免整个末段被当成空片段丢掉。
+    """
+    raw = str(text).replace('＋', '+').replace('++', '+plus+')
+    parts = [p.strip() for p in raw.split('+') if p.strip()]
     if not parts:
         return None
     vks = []
@@ -500,6 +544,7 @@ def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
     等待超时(30s)则返回失败、不发送，彻底规避并发剪贴板/焦点/输入竞争。
     """
     owned = False
+    saved_clip = None       # 发送前用户剪贴板里的内容，发送结束归还
     try:
         hr = win32event.WaitForSingleObject(_SEND_MUTEX, 30000)
         # WAIT_ABANDONED 也代表本线程已获得所有权（另一实例在关键段内被强杀），
@@ -524,11 +569,16 @@ def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
         if blocked:
             time.sleep(1.0)
 
+        # 前台激活失败的处理：有点击序列时继续（点击本身通常会把目标带到前台），
+        # 没有点击序列时中止本次发送，避免内容落到当前真正的前台窗口
+        steps = list(click_steps or [])
         if not force_foreground_window(hwnd):
-            return False
+            if not steps:
+                print("发送中止：未能激活目标窗口且未配置点击序列，已跳过本次发送以避免内容落入其它窗口。")
+                return False
+            print("[提示] 目标窗口未确认取得前台，将继续按配置坐标点击（点击可能顺带激活目标）。")
 
         # 点击序列：按配置顺序逐个点击，每步按自身间隔等待
-        steps = list(click_steps or [])
         if steps:
             done, interrupted = run_click_steps(steps, should_stop)
             if interrupted:
@@ -540,6 +590,11 @@ def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
             time.sleep(0.2)        # 点击落定后再粘贴
 
         if paste:
+            # 剪贴板是全局资源：先记下用户原本的内容，发送结束在 finally 里放回去
+            try:
+                saved_clip = pyperclip.paste()
+            except Exception:
+                saved_clip = None
             pyperclip.copy(text)
             time.sleep(0.05)
             win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
@@ -568,6 +623,13 @@ def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
         if blocked:
             try:
                 user32.BlockInput(False)
+            except Exception:
+                pass
+        # 归还用户原来的剪贴板内容。只在确实读到文本时恢复：
+        # 图片/文件类型的剪贴板读不到文本（空串），此时保持原样，避免把剪贴板清成空文本
+        if saved_clip:
+            try:
+                pyperclip.copy(saved_clip)
             except Exception:
                 pass
         if owned:
@@ -1168,6 +1230,36 @@ class CheckIndicatorStyle(QProxyStyle):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  数值框滚轮守卫
+# ═══════════════════════════════════════════════════════════════
+
+class WheelGuard(QObject):
+    """未获得焦点时把滚轮事件转交给所在滚动容器，数值框本身不改值。
+
+    QAbstractSpinBox 的 wheelEvent 不检查焦点，滚动设置列时经过坐标/间隔框就会
+    改数值并触发配置落盘；这里只放行"已经点进去（有焦点）"的滚轮，同时保证列照常滚动。
+    """
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.Type.Wheel or obj.hasFocus():
+            return False
+        area = obj.parentWidget()
+        while area is not None and not isinstance(area, QAbstractScrollArea):
+            area = area.parentWidget()
+        if area is None:
+            return True            # 不在滚动容器里：直接吞掉，至少不要改数值
+        # 同一个事件对象不能被二次投递（实测滚动容器收不到），必须按参数新建一个
+        try:
+            forwarded = QWheelEvent(event.position(), event.globalPosition(), event.pixelDelta(),
+                                    event.angleDelta(), event.buttons(), event.modifiers(),
+                                    event.phase(), event.inverted())
+            QApplication.sendEvent(area.viewport(), forwarded)
+        except Exception as e:
+            print(f"[滚轮转发失败] {e}")
+        return True
+
+
+# ═══════════════════════════════════════════════════════════════
 #  拖拽准星控件
 # ═══════════════════════════════════════════════════════════════
 
@@ -1342,8 +1434,11 @@ class SchedulerWorker(QThread):
                                           self.lock_input, self.isInterruptionRequested)
                 self.log_signal.emit("✅ 发送成功。" if ok else "❌ 发送失败。")
 
-                # 追加后续：延时指定时长后再发送
-                if self.suffix.strip() and self.suffix_delay > 0:
+                # 追加后续：延时指定时长后再发送；主发送没成功就跳过，
+                # 否则这段内容会被打进"当时的前台窗口"
+                if not ok and self.suffix.strip() and self.suffix_delay > 0:
+                    self.log_signal.emit("⚠️  主发送未成功，已跳过本次追加后续。")
+                elif self.suffix.strip() and self.suffix_delay > 0:
                     self.log_signal.emit(f"🕒 {self.suffix_delay} 秒后发送追加后续...")
                     remaining = float(self.suffix_delay)
                     while remaining > 0 and not self.isInterruptionRequested():
@@ -1406,6 +1501,9 @@ class MainWindow(QMainWindow):
         if os.path.exists(self._config_file):
             self._watcher.addPath(self._config_file)
         self._watcher.fileChanged.connect(self._on_config_watcher)
+        self._wheel_guard = WheelGuard(self)   # 数值框滚轮守卫：未聚焦时不吃滚轮
+        self._closing = False                  # 关闭流程中：屏蔽发送类操作，避免等待期事件重入
+        self._last_self_write = None           # 最近一次自写盘指纹 (mtime_ns, size)，用于识别"这份文件是我写的"
 
         self._setup_style()
         self._init_ui()
@@ -1439,6 +1537,11 @@ class MainWindow(QMainWindow):
 
     def _setup_style(self):
         self.setStyleSheet(STYLE_SHEET)
+
+    def _guard_wheel(self, *widgets):
+        """给数值框装上滚轮守卫：未聚焦时滚轮只滚动所在列，不改数值。"""
+        for widget in widgets:
+            widget.installEventFilter(self._wheel_guard)
 
     @staticmethod
     def _card(title_text, icon_text=""):
@@ -1537,6 +1640,7 @@ class MainWindow(QMainWindow):
 
         h.addStretch()
 
+        self._toolbar_buttons = []
         for text, tip, slot in (
             ("💾 保存配置", "立即把当前配置写入本地配置文件", self._save_config_now),
             ("📥 导入配置", "从本地 ini 文件导入配置到当前窗口", self._import_config_file),
@@ -1548,6 +1652,7 @@ class MainWindow(QMainWindow):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setToolTip(tip)
             btn.clicked.connect(slot)
+            self._toolbar_buttons.append(btn)
             h.addWidget(btn)
         return bar
 
@@ -1651,12 +1756,12 @@ class MainWindow(QMainWindow):
         self.btn_toggle.clicked.connect(self.toggle_task)
         h.addWidget(self.btn_toggle, 2)
 
-        btn_test = QPushButton("⚡  立即测试发送")
-        btn_test.setProperty("class", "btn-secondary")
-        btn_test.setMinimumHeight(42)
-        btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_test.clicked.connect(self.test_trigger)
-        h.addWidget(btn_test, 1)
+        self.btn_test = QPushButton("⚡  立即测试发送")
+        self.btn_test.setProperty("class", "btn-secondary")
+        self.btn_test.setMinimumHeight(42)
+        self.btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_test.clicked.connect(self.test_trigger)
+        h.addWidget(self.btn_test, 1)
 
         h.addStretch()
 
@@ -1697,18 +1802,26 @@ class MainWindow(QMainWindow):
         return panel
 
     def _toggle_log(self):
-        """展开 / 收起运行日志：收起时整块隐藏，展开时给它固定高度，其余两段按原比例分。"""
+        """展开 / 收起运行日志。
+
+        只隐藏日志正文：标题行（含本按钮与「清空日志」）必须始终保留，否则收起后
+        连再展开的入口都没有了。收起时把该段压到只剩标题行高度，空间还给上面两段。
+        """
         self._log_visible = not self._log_visible
-        self.log_panel.setVisible(self._log_visible)
+        self.log_view.setVisible(self._log_visible)
         self.btn_log_toggle.setText(("▾  " if self._log_visible else "▸  ") + "运行日志")
         sizes = self.split_v.sizes()
-        if self._log_visible and len(sizes) == 3:
-            total = sum(sizes) or 1
+        if len(sizes) != 3:
+            return
+        total = sum(sizes) or 1
+        if self._log_visible:
             log_h = min(200, max(90, int(total * 0.18)))
-            rest = max(2, total - log_h)
-            head, body = max(1, sizes[0]), max(1, sizes[1])
-            keep = head + body
-            self.split_v.setSizes([int(rest * head / keep), int(rest * body / keep), log_h])
+        else:
+            log_h = 44      # 只剩标题行；面板自身的最小高度会兜住下限
+        rest = max(2, total - log_h)
+        head, body = max(1, sizes[0]), max(1, sizes[1])
+        keep = head + body
+        self.split_v.setSizes([int(rest * head / keep), int(rest * body / keep), log_h])
 
     def _collapsible_section(self, title, tip):
         """可折叠区块：返回 (容器, 内容布局, 标题按钮, 内容控件)。"""
@@ -1948,6 +2061,7 @@ class MainWindow(QMainWindow):
         sp_d.setValue(int(delay_ms))
         sp_d.setMinimumWidth(88)
         sp_d.setToolTip("执行这个点击点之前等待的时长（毫秒）")
+        self._guard_wheel(sp_x, sp_y, sp_d)
 
         row.addWidget(num)
         row.addWidget(sp_x)
@@ -1977,7 +2091,7 @@ class MainWindow(QMainWindow):
         num.setFixedWidth(16)
         num.setProperty("class", "meta")
         edit = QLineEdit(str(key))
-        edit.setPlaceholderText("如 Enter / Tab / Ctrl+A / F5")
+        edit.setPlaceholderText("如 Enter / Tab / Ctrl+A / F5（加号写 plus）")
         edit.setMinimumWidth(130)
         edit.setToolTip("单个按键或组合键（用 + 连接表示同时按下）")
         sp_d = QSpinBox()
@@ -1986,6 +2100,7 @@ class MainWindow(QMainWindow):
         sp_d.setValue(int(delay_ms))
         sp_d.setMinimumWidth(92)
         sp_d.setToolTip("发送这个按键之前等待的时长（毫秒）")
+        self._guard_wheel(sp_d)
 
         row.addWidget(num)
         row.addWidget(edit)
@@ -2178,6 +2293,7 @@ class MainWindow(QMainWindow):
         self.suffix_delay_spin.setMinimumHeight(26)
         self.suffix_delay_spin.valueChanged.connect(self._on_ui_changed_for_save)
         delay_row.addWidget(self.suffix_delay_spin)
+        self._guard_wheel(self.suffix_delay_spin)
         hint = QLabel("循环模式下不得超过任务间隔")
         hint.setProperty("class", "hint")
         delay_row.addWidget(hint)
@@ -2281,6 +2397,7 @@ class MainWindow(QMainWindow):
         self.spin_interval.setMinimumHeight(36)
         self.spin_interval.setMinimumWidth(110)
         self.spin_interval.setStyleSheet("QSpinBox { font-size: 12pt; font-weight: 600; }")
+        self._guard_wheel(self.spin_interval)
         opt_row.addWidget(self.spin_interval, 1)
 
         self.chk_immediate = QCheckBox("立即发第 1 次")
@@ -2446,6 +2563,7 @@ class MainWindow(QMainWindow):
         try:
             save_config_file({'general': self._collect_persist_dict()}, self._config_file)
             self._dirty = False
+            self._remember_self_write()
             if hasattr(self, 'lbl_save_state'):
                 self.lbl_save_state.setText("已保存 " + datetime.datetime.now().strftime('%H:%M:%S'))
         except Exception as e:
@@ -2460,6 +2578,25 @@ class MainWindow(QMainWindow):
                     self._watcher.addPath(self._config_file)
             except Exception:
                 pass
+
+    def _remember_self_write(self):
+        """记录刚写盘文件的指纹，供热更新识别"这份文件就是我自己写的"。"""
+        try:
+            st = os.stat(self._config_file)
+            self._last_self_write = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            self._last_self_write = None
+
+    def _is_own_write(self):
+        """当前盘上文件是否就是本程序最近一次写下的那一份。"""
+        fingerprint = getattr(self, '_last_self_write', None)
+        if not fingerprint:
+            return False
+        try:
+            st = os.stat(self._config_file)
+        except OSError:
+            return False
+        return (st.st_mtime_ns, st.st_size) == fingerprint
 
     def _apply_config(self, cfg):
         """把加载到的配置应用到 UI（热更新入口也用）。"""
@@ -2488,9 +2625,11 @@ class MainWindow(QMainWindow):
                 click_steps = [{'x': old_x, 'y': old_y, 'delay_ms': 0}]
         self._set_click_steps(click_steps)
 
-        key_steps = cfg.get('key_steps') or []
-        if not key_steps:
-            key_steps = [{'key': 'enter', 'delay_ms': 0}]      # 旧配置默认回车
+        # None = 配置里没有这个键（旧配置）→ 沿用默认回车；
+        # [] = 用户明确清空按键序列 → 保持为空，不要凭空塞回一条回车
+        key_steps = cfg.get('key_steps')
+        if key_steps is None:
+            key_steps = [{'key': 'enter', 'delay_ms': 0}]
         self._set_key_steps(key_steps)
 
         # 匹配目标窗口标题
@@ -2517,12 +2656,20 @@ class MainWindow(QMainWindow):
         self._set_prompts(prompts)
         self.preface_edit.setPlainText(cfg.get('preface', ''))
         self.suffix_edit.setPlainText(cfg.get('suffix', ''))
-        self.suffix_delay_spin.setValue(int(cfg.get('suffix_delay', 0)))
+        wanted_delay = int(cfg.get('suffix_delay', 0) or 0)
+        self.suffix_delay_spin.setValue(wanted_delay)
+        if self.suffix_delay_spin.value() != wanted_delay:
+            self._append_log("⚠️  追加后续延时 %d 秒超过当前循环间隔允许的上限，已收紧为 %d 秒。"
+                             % (wanted_delay, self.suffix_delay_spin.value()))
         self.chk_lock_input.setChecked(bool(cfg.get('lock_input', True)))
         self._sync_optional_sections()
 
         self._set_loading_flag(False)
         self._refresh_schedule_preview()
+
+        # 加载期被自动修正过的字段：一次性告知，避免用户以为配置莫名其妙变了
+        for warning in (cfg.get('load_warnings') or []):
+            self._append_log("⚠️  配置已自动修正：" + warning)
 
     def _on_config_watcher(self, path):
         """配置文件被外部修改 → 防抖后重新加载并同步 UI。"""
@@ -2539,12 +2686,17 @@ class MainWindow(QMainWindow):
         self._reload_timer.start(400)
 
     def _reload_from_disk(self):
+        if self._is_own_write():
+            # 文件就是本程序刚写下的那一份（防抖落盘触发的 watcher 事件）：
+            # 既不需要重载，也不要打印"已重新加载"去误导用户
+            return
         if getattr(self, '_dirty', False):
-            self._append_log("⚠️  检测到本地未保存改动，已跳过文件热更新以保护正在编辑的内容。")
+            self._append_log("⚠️  检测到外部改动，但本地有未保存的编辑：已跳过同步，"
+                             "本次自动保存会覆盖这次外部改动。")
             return
         cfg = load_config_file(self._config_file)
         self._apply_config(cfg)
-        self._append_log("🔄  配置热更新：已重新加载 config-win-auto-sender.ini")
+        self._append_log("🔄  配置热更新：已重新加载 " + os.path.basename(self._config_file))
 
     def _set_prompts(self, prompts):
         """用给定列表重建内容工作台（顺序即发送顺序，至少保留一条）。"""
@@ -2891,6 +3043,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "配置错误", "请至少添加一条非空的发送内容！")
             return None
 
+        # 空转任务：既不粘贴也没有任何按键 → 每个周期什么都不做，却一直报"发送成功"
+        if not self.chk_paste.isChecked() and not self._get_key_steps():
+            QMessageBox.warning(self, "配置错误",
+                                "已关闭「粘贴发送内容」，按键序列又是空的，启动后不会发送任何内容。\n"
+                                "请在按键序列里至少留一个按键，或重新勾选粘贴发送内容。")
+            return None
+
         is_single = self.btn_seg_single.property("active")
         now = datetime.datetime.now()
 
@@ -2933,6 +3092,13 @@ class MainWindow(QMainWindow):
                     "按当前开始/结束时间与间隔，结束时间之前已无可用触发时刻。\n请调整时间或间隔后重试。")
                 return None
 
+        # 填了追加后续却把延时留成 0：这段内容永远不会被发送（测试发送不发后缀，故只拦启动）
+        if not for_test and self.suffix_edit.toPlainText().strip() and self.suffix_delay_spin.value() == 0:
+            QMessageBox.warning(self, "配置错误",
+                                "「追加后续」已填写内容，但延时是 0 秒，这段内容不会被发送。\n"
+                                "请把延时改成大于 0 的值，或清空追加后续。")
+            return None
+
         # 按键序列先校验按键名，避免运行到一半才发现无法识别
         key_steps = self._get_key_steps()
         bad_keys = [s['key'] for s in key_steps if parse_key_combo(s['key']) is None]
@@ -2964,6 +3130,8 @@ class MainWindow(QMainWindow):
 
     def _new_window(self):
         """新开一个程序窗口，用于新的目标窗口：自动生成唯一实例名，独立进程/独立配置。"""
+        if self._closing:
+            return
         name = "w" + uuid.uuid4().hex[:8]
         if getattr(sys, 'frozen', False):
             args = [sys.executable, "--name", name]
@@ -2977,6 +3145,8 @@ class MainWindow(QMainWindow):
         self._append_log(f"已新开窗口（实例 {name}），用于新的目标窗口。")
 
     def toggle_task(self):
+        if self._closing:
+            return
         if self.worker and self.worker.isRunning():
             # 停止：用局部引用等待，避免 processEvents 期间 finished 槽把 self.worker 置空后
             # 循环条件再访问 None 抛 AttributeError
@@ -3047,6 +3217,8 @@ class MainWindow(QMainWindow):
     # ── 测试 ────────────────────────────────────────────────
 
     def test_trigger(self):
+        if self._closing:
+            return
         # 互斥守卫前置：已有测试在发送时直接拒绝，不再走配置校验弹框
         if getattr(self, '_test_busy', False):
             self._append_log("⚠️  已有一次测试发送进行中，请稍候再试。")
@@ -3095,7 +3267,19 @@ class MainWindow(QMainWindow):
 
     # ── 关闭 ────────────────────────────────────────────────
 
+    def _set_closing_ui(self, closing):
+        """关闭流程中禁用会启动新工作或改配置的按钮，给用户明确的"正在关闭"反馈。"""
+        buttons = [getattr(self, 'btn_toggle', None), getattr(self, 'btn_test', None)]
+        buttons += list(getattr(self, '_toolbar_buttons', []))
+        for btn in buttons:
+            if btn is not None:
+                btn.setEnabled(not closing)
+
     def closeEvent(self, event):
+        # 关闭期间禁止再启动/测试/导入：等待线程时仍在 processEvents，界面可点，
+        # 重入会启动新线程并与窗口析构竞争（表现为退出期 fail-fast）
+        self._closing = True
+        self._set_closing_ui(True)
         if self.worker and self.worker.isRunning():
             worker = self.worker
             worker.requestInterruption()
@@ -3115,6 +3299,8 @@ class MainWindow(QMainWindow):
         self._flush_before_close()
         if not self._cleanup_tmp_config():
             event.ignore()
+            self._closing = False       # 用户选择"取消关闭"：恢复界面可操作
+            self._set_closing_ui(False)
             return
         self._save_ui_state()
         event.accept()
@@ -3131,6 +3317,20 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"[关闭前保存失败] {e}")
 
+    @staticmethod
+    def _instance_has_content(cfg):
+        """实例配置里是否存在用户真正配置过的东西（发送内容、附加文本、点击/按键步骤）。
+
+        目标窗口标题不参与判断：新实例的窗口下拉会自动选中列表首项，无法区分
+        "用户选的"与"程序自动填的"。
+        """
+        keys = cfg.get('key_steps') or []
+        default_keys = (len(keys) == 1
+                        and str(keys[0].get('key', '')).strip().lower() in ('enter', 'return', '回车'))
+        return bool(any(cfg.get('prompts') or [])) or bool(cfg.get('preface')) \
+            or bool(cfg.get('suffix')) or bool(cfg.get('click_steps') or []) \
+            or (bool(keys) and not default_keys)
+
     def _cleanup_tmp_config(self):
         """附属窗口（--name）关闭时的配置回收策略，返回是否允许关闭。
         未配置任何内容 → 判定为垃圾直接删除，不打扰；
@@ -3144,22 +3344,14 @@ class MainWindow(QMainWindow):
             self._flush_pending_save()
         except Exception:
             pass
-        # 用户从未在界面上真实改动过（默认新建未使用）→ 视为垃圾，静默删除配置直接关闭，不打扰
-        if not self._user_touched:
-            try:
-                if os.path.exists(self._config_file):
-                    os.remove(self._config_file)
-                    print(f"[清理] 已删除未使用的实例配置: {self._config_file}")
-            except Exception:
-                pass
-            return True
+        # 两个信号任一成立都不能静默删除：
+        #   ① 文件里确实有用户配置过的内容（只凭 _user_touched 会把上次选择保留的实例删掉）；
+        #   ② 本次会话动过界面（哪怕只是选了个窗口，也不能当作没发生）
         try:
-            cfg = load_config_file(self._config_file)
+            cfg = load_config_file(self._config_file) if os.path.exists(self._config_file) else {}
         except Exception:
             cfg = {}
-        has_data = bool(any(cfg.get('prompts') or [])) or bool(cfg.get('window_title')) \
-            or bool(cfg.get('preface')) or bool(cfg.get('suffix'))
-        if not has_data:
+        if not self._user_touched and not self._instance_has_content(cfg):
             try:
                 if os.path.exists(self._config_file):
                     os.remove(self._config_file)
@@ -3200,6 +3392,8 @@ class MainWindow(QMainWindow):
 
     def _import_config_file(self):
         """从用户选择的 ini 文件导入配置到当前窗口，并覆盖当前窗口的配置文件。"""
+        if self._closing:
+            return
         if self.worker and self.worker.isRunning():
             QMessageBox.warning(self, "不可导入", "任务运行中，请先停止再导入配置。")
             return
@@ -3220,6 +3414,8 @@ class MainWindow(QMainWindow):
 
     def _reset_factory_config(self):
         """把当前窗口配置恢复为出厂默认（清空发送内容、重置全部参数）。"""
+        if self._closing:
+            return
         if self.worker and self.worker.isRunning():
             QMessageBox.warning(self, "不可重置", "任务运行中，请先停止再恢复出厂。")
             return
