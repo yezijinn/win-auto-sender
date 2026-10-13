@@ -112,6 +112,32 @@ def valid_instance_name(name):
     return name.upper() not in RESERVED_WIN_NAMES
 
 
+# 同名实例占用检测：每个实例名对应一个命名互斥对象，第二个同名实例会拿到
+# ERROR_ALREADY_EXISTS，据此避免误删对方正在使用的配置文件。
+INSTANCE_MUTEX_PREFIX = "Local\\WindowsLoopSend_Instance_"
+ERROR_ALREADY_EXISTS = 183
+
+
+def acquire_instance_lock(instance, prev_handle=None):
+    """为实例名建立命名互斥对象，返回 (句柄, 是否已有同名实例在运行)。
+
+    只持有句柄、不获取所有权（bInitialOwner=False）：同名实例再次 CreateMutex
+    会得到 ERROR_ALREADY_EXISTS。instance 为空（默认窗口）时不建锁。
+    """
+    if prev_handle is not None:
+        try:
+            win32api.CloseHandle(prev_handle)
+        except Exception:
+            pass
+    if not instance:
+        return None, False
+    try:
+        handle = win32event.CreateMutex(None, False, INSTANCE_MUTEX_PREFIX + instance)
+        return handle, win32api.GetLastError() == ERROR_ALREADY_EXISTS
+    except Exception:
+        return None, False
+
+
 def split_prompt_text(text):
     """把多提示词文本分割成若干条（兼容各种换行）。
     - 若含内部不可见分隔符（PROMPT_SEP，程序写入），按它精确分割
@@ -362,27 +388,29 @@ def save_config_file(cfg, path=None):
         parser.set('prompts', 'format', 'json')
         parser.set('prompts', 'content', json.dumps([str(p) for p in prompts], ensure_ascii=False))
 
-        # 原子写入：先写临时文件再 os.replace，避免掉电/崩溃留下半写文件损坏配置
-        tmp_path = path + '.tmp'
-        # 仅清理本配置文件自身的历史残留同名 tmp（不动其它实例的 tmp，消除多实例并发误删）
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        # 原子写入：先写临时文件再 os.replace，避免掉电/崩溃留下半写文件损坏配置。
+        # 临时文件名带 pid：同名实例各写各的中间文件，避免并发保存时互相删掉对方的 tmp。
+        tmp_path = "%s.%d.tmp" % (path, os.getpid())
         with open(tmp_path, 'w', encoding='utf-8') as f:
             parser.write(f)
-        # Windows 上目标文件可能被其它进程（编辑器/杀软/同名实例）瞬时占用导致
-        # os.replace 抛 PermissionError，做有限次短重试而非直接判定写盘失败
+        # Windows 上目标文件可能被编辑器/杀软/同名实例瞬时占用（PermissionError），
+        # 或中间文件被清理掉（FileNotFoundError）。两者都做有限次短重试。
         last_err = None
         for attempt in range(3):
             try:
                 os.replace(tmp_path, path)
                 last_err = None
                 break
-            except PermissionError as e:
+            except (PermissionError, FileNotFoundError) as e:
                 last_err = e
                 time.sleep(0.06 * (attempt + 1))
+                if isinstance(e, FileNotFoundError):
+                    # 中间文件已不在，重试前补写一份，否则后续必然同样失败
+                    try:
+                        with open(tmp_path, 'w', encoding='utf-8') as f:
+                            parser.write(f)
+                    except OSError:
+                        pass
         if last_err is not None:
             raise last_err
     except Exception as e:
@@ -435,8 +463,11 @@ def force_foreground_window(hwnd, verify_seconds=0.8):
             user32.AttachThreadInput(current_tid, target_tid, False)
 
 
-# 跨实例发送互斥锁：同一时刻只允许一个实例执行发送关键段，规避多开冲突
+# 跨实例发送互斥锁：同一时刻只允许一个实例执行发送关键段，规避多开冲突。
+# 用 Local\ 前缀（同一登录会话内生效）。跨会话需 Global\ 前缀，而创建全局命名对象
+# 要求 SeCreateGlobalPrivilege，普通账户默认没有，故不采用。
 _SEND_MUTEX = win32event.CreateMutex(None, False, "Local\\WindowsLoopSend_SendMutex")
+SEND_MUTEX_WAIT_SEC = 30.0     # 等待发送互斥锁的上限；超出则本次不发送并记入日志
 
 
 # 按键名 → 虚拟键码。除英文名外兼容少量中文写法（回车 / 空格 / 上 等）
@@ -494,8 +525,9 @@ def parse_key_combo(text):
     return vks
 
 
-def press_key_combo(text):
+def press_key_combo(text, log=None):
     """按下并释放一个按键组合（多个键用 + 连接表示同时按下）。"""
+    log = log if log is not None else print
     vks = parse_key_combo(text)
     if not vks:
         return False
@@ -508,7 +540,7 @@ def press_key_combo(text):
             time.sleep(0.02)
         return True
     except Exception as e:
-        print(f"按键失败 {text!r}：{e}")
+        log(f"按键失败 {text!r}：{e}")
         return False
 
 
@@ -523,8 +555,9 @@ def wait_interruptible(seconds, should_stop=None):
     return True
 
 
-def run_click_steps(steps, should_stop=None):
+def run_click_steps(steps, should_stop=None, log=None):
     """按顺序点击各坐标点，每一步先等待自身的间隔；返回 (已完成步数, 是否被打断)。"""
+    log = log if log is not None else print
     done = 0
     for step in steps or []:
         # 间隔为 0 时也要先看一次停止请求，避免停不下来时仍多执行一步
@@ -539,14 +572,15 @@ def run_click_steps(steps, should_stop=None):
             time.sleep(0.03)
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         except Exception as e:
-            print(f"点击失败 {step!r}：{e}")
+            log(f"点击失败 {step!r}：{e}")
             return done, False
         done += 1
     return done, False
 
 
-def run_key_steps(steps, should_stop=None):
+def run_key_steps(steps, should_stop=None, log=None):
     """按顺序发送按键，每一步先等待自身的间隔；返回 (已完成步数, 失败按键, 是否被打断)。"""
+    log = log if log is not None else print
     done = 0
     for step in steps or []:
         if should_stop is not None and should_stop():
@@ -556,38 +590,51 @@ def run_key_steps(steps, should_stop=None):
         name = str(step.get('key', '')).strip()
         if not name:
             continue
-        if not press_key_combo(name):
+        if not press_key_combo(name, log):
             return done, name, False
         done += 1
     return done, None, False
 
 
 def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
-                         paste=True, lock_input=True, should_stop=None):
+                         paste=True, lock_input=True, should_stop=None, log=None):
     """聚焦目标窗口 → 按序列点击 → 粘贴内容 → 按序列发送按键。
 
     click_steps / key_steps 为步骤列表，每一步自带「执行前等待」的毫秒间隔；
     传空列表表示跳过该阶段。lock_input 为真时发送前锁定真实鼠标键盘约 1 秒，
     BlockInput 模拟输入不受影响；需管理员权限，否则静默跳过锁定。
+    log 为诊断输出通道（默认 print）；打包后无控制台，调用方应传入界面日志。
 
     多实例冲突规避：以进程级命名互斥锁保护整个发送关键段（点击 + 剪贴板 +
-    粘贴 + 按键）。同一时刻只允许一个实例执行，其余实例排队，
-    等待超时(30s)则返回失败、不发送，彻底规避并发剪贴板/焦点/输入竞争。
+    粘贴 + 按键）。同一时刻只允许一个实例执行，其余实例排队等待（上限
+    SEND_MUTEX_WAIT_SEC 秒），超时则本次不发送并把原因记入日志。
     """
+    log = log if log is not None else print
     owned = False
     saved_clip = None       # 发送前用户剪贴板里的内容，发送结束归还
     try:
-        hr = win32event.WaitForSingleObject(_SEND_MUTEX, 30000)
+        # 分段等待互斥锁：期间响应停止请求，避免关窗时被上限时长阻塞在等锁上
+        deadline = time.time() + SEND_MUTEX_WAIT_SEC
+        hr = win32event.WAIT_TIMEOUT
+        while True:
+            hr = win32event.WaitForSingleObject(_SEND_MUTEX, 200)
+            if hr in (win32event.WAIT_OBJECT_0, win32event.WAIT_ABANDONED):
+                break
+            if should_stop is not None and should_stop():
+                log("发送中止：等待发送互斥锁期间收到停止请求，本次未发送。")
+                return False
+            if time.time() >= deadline:
+                break
         # WAIT_ABANDONED 也代表本线程已获得所有权（另一实例在关键段内被强杀），
         # 必须一并视为 owned，否则所有权泄漏导致后续发送持续失败
         owned = hr in (win32event.WAIT_OBJECT_0, win32event.WAIT_ABANDONED)
         if hr == win32event.WAIT_ABANDONED:
-            print("[提示] 上次发送被强制终止，已接管发送互斥锁并继续。")
+            log("[提示] 上次发送被强制终止，已接管发送互斥锁并继续。")
     except Exception as e:
-        print(f"发送失败：获取发送互斥锁异常 {e}")
+        log(f"发送失败：获取发送互斥锁异常 {e}")
         return False
     if not owned:
-        print("发送失败：等待发送互斥锁超时(>30s)，已跳过本条以规避并发输入竞争。")
+        log(f"本次未发送：等待发送互斥锁超时（另一实例占用发送关键段已超过 {SEND_MUTEX_WAIT_SEC:.0f} 秒）。")
         return False
     blocked = False
     try:
@@ -600,25 +647,25 @@ def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
         if blocked:
             time.sleep(1.0)
         elif lock_input:
-            print("[提示] 未能锁定鼠标键盘（通常因未以管理员权限运行），本次发送未启用锁定。")
+            log("[提示] 未能锁定鼠标键盘（通常因未以管理员权限运行），本次发送未启用锁定。")
 
         # 前台激活失败的处理：有点击序列时继续（点击本身通常会把目标带到前台），
         # 没有点击序列时中止本次发送，避免内容落到当前真正的前台窗口
         steps = list(click_steps or [])
         if not force_foreground_window(hwnd):
             if not steps:
-                print("发送中止：未能激活目标窗口且未配置点击序列，已跳过本次发送以避免内容落入其它窗口。")
+                log("发送中止：未能激活目标窗口且未配置点击序列，已跳过本次发送以避免内容落入其它窗口。")
                 return False
-            print("[提示] 目标窗口未确认取得前台，将继续按配置坐标点击（点击可能顺带激活目标）。")
+            log("[提示] 目标窗口未确认取得前台，将继续按配置坐标点击（点击可能顺带激活目标）。")
 
         # 点击序列：按配置顺序逐个点击，每步按自身间隔等待
         if steps:
-            done, interrupted = run_click_steps(steps, should_stop)
+            done, interrupted = run_click_steps(steps, should_stop, log)
             if interrupted:
-                print("发送中止：收到停止请求。")
+                log("发送中止：收到停止请求。")
                 return False
             if done < len(steps):
-                print("发送失败：点击序列未执行完。")
+                log("发送失败：点击序列未执行完。")
                 return False
             time.sleep(0.2)        # 点击落定后再粘贴
 
@@ -641,16 +688,16 @@ def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
         # 按键序列：默认一条回车，可换成任意按键组合
         key_list = list(key_steps or [])
         if key_list:
-            done, failed, interrupted = run_key_steps(key_list, should_stop)
+            done, failed, interrupted = run_key_steps(key_list, should_stop, log)
             if interrupted:
-                print("发送中止：收到停止请求。")
+                log("发送中止：收到停止请求。")
                 return False
             if failed is not None:
-                print(f"发送失败：无法识别的按键 {failed!r}。")
+                log(f"发送失败：无法识别的按键 {failed!r}。")
                 return False
         return True
     except Exception as e:
-        print(f"发送异常: {e}")
+        log(f"发送异常: {e}")
         return False
     finally:
         # 无论成功/失败/异常，发送结束都解锁鼠标键盘，避免锁死
@@ -1402,6 +1449,7 @@ class TargetPickerLabel(QFrame):
 class TestSendThread(QThread):
     """「立即测试」发送在后台线程执行，避免占用 GUI 主线程导致界面冻结。"""
     done_signal = Signal(bool)
+    log_signal = Signal(str)          # 发送过程的诊断信息，回主线程写入运行日志
 
     def __init__(self, hwnd, text, click_steps, key_steps, paste=True, lock_input=True, parent=None):
         super().__init__(parent)
@@ -1417,7 +1465,8 @@ class TestSendThread(QThread):
             # 传入中断通道：关窗前会 requestInterruption，让发送在等锁/等待间隔时及时退出，
             # 避免关窗等待超时后进程仍在发送中途退出、目标窗口留下半截内容
             ok = click_and_paste_send(self.hwnd, self.text, self.click_steps, self.key_steps,
-                                      self.paste, self.lock_input, self.isInterruptionRequested)
+                                      self.paste, self.lock_input, self.isInterruptionRequested,
+                                      self.log_signal.emit)
         except Exception:
             ok = False
         self.done_signal.emit(ok)
@@ -1520,7 +1569,8 @@ class SchedulerWorker(QThread):
                 self.log_signal.emit("⏰ 触发 — 正在聚焦并发送...")
                 ok = click_and_paste_send(hwnd, compose_send_text(self.preface, self.pick_prompt()),
                                           self.click_steps, self.key_steps, self.paste,
-                                          self.lock_input, self.isInterruptionRequested)
+                                          self.lock_input, self.isInterruptionRequested,
+                                          self.log_signal.emit)
                 self.log_signal.emit("✅ 发送成功。" if ok else "❌ 发送失败。")
 
                 # 追加后续：延时指定时长后再发送；主发送没成功就跳过，
@@ -1538,7 +1588,8 @@ class SchedulerWorker(QThread):
                             self.log_signal.emit("⚠️  目标窗口已失效，已跳过追加后续。")
                         else:
                             ok2 = click_and_paste_send(hwnd, self.suffix, self.click_steps, self.key_steps,
-                                                       self.paste, self.lock_input, self.isInterruptionRequested)
+                                                       self.paste, self.lock_input,
+                                                       self.isInterruptionRequested, self.log_signal.emit)
                             self.log_signal.emit("✅ 追加后续已发送。" if ok2 else "❌ 追加后续发送失败。")
 
                 # 按绝对网格推进下一次触发：与预览 compute_fire_list 同一口径。
@@ -2396,6 +2447,8 @@ class MainWindow(QMainWindow):
         self._prompt_loading = False   # 内容编辑区程序化回填时抑制 textChanged 回写
         self._log_visible = True       # 日志面板展开状态
         self._config_file = default_config_file(instance_name)
+        # 同名实例占用检测：有第二个同名实例时不能回收共用配置文件
+        self._instance_mutex, self._instance_shared = acquire_instance_lock(instance_name)
         self._loading = True     # 初始化期间抑制自动保存
         self._initializing = True  # 覆盖整个构造期（_set_mode 会再触发保存）
         self._pending_save = False
@@ -4276,6 +4329,9 @@ class MainWindow(QMainWindow):
             self._watcher.removePath(p)
         self.instance_name = '' if new == APP_BASE_NAME else new
         self._config_file = new_file
+        # 改名后重建占用锁：旧名的锁释放，新名若已被占用则标记为共用
+        self._instance_mutex, self._instance_shared = acquire_instance_lock(
+            self.instance_name, self._instance_mutex)
         if os.path.exists(new_file):
             self._watcher.addPath(new_file)      # 先摘旧路径再挂新路径，避免监听悬空
         # 界面状态（几何/分栏/折叠/迷你窗口）随名称一起迁移
@@ -4473,6 +4529,8 @@ class MainWindow(QMainWindow):
         self._test_thread = TestSendThread(cfg['hwnd'], text, cfg['click_steps'], cfg['key_steps'],
                                            cfg.get('paste', True), cfg.get('lock_input', True))
         self._test_thread.done_signal.connect(self._on_test_done)
+        # 发送过程诊断（等锁超时、前台未确认、锁键鼠未生效等）回写运行日志
+        self._test_thread.log_signal.connect(self._append_log)
         # 线程引用同样在 finished 后释放，避免 run() 未退出时被析构
         self._test_thread.finished.connect(self._on_test_finished)
         try:
@@ -4552,7 +4610,22 @@ class MainWindow(QMainWindow):
             self._mini = None
         else:
             self._save_ui_state()
+        self._release_instance_lock()
         event.accept()
+
+    def _release_instance_lock(self):
+        """关闭被接受后释放同名实例占用锁。
+
+        本实例已不再运行，实例名应可被再次使用；不释放的话同进程内重新打开同名
+        实例会被误判为「另有同名实例在运行」，配置回收策略随之失效。
+        """
+        handle = getattr(self, '_instance_mutex', None)
+        self._instance_mutex = None
+        if handle is not None:
+            try:
+                win32api.CloseHandle(handle)
+            except Exception:
+                pass
 
     def _flush_before_close(self):
         """关闭前把防抖窗口内尚未落盘的编辑写入配置，避免丢失刚改的内容。
@@ -4593,6 +4666,10 @@ class MainWindow(QMainWindow):
             self._flush_pending_save()
         except Exception:
             pass
+        # 另有同名实例在运行：这份配置文件双方共用，删除会破坏对方实例
+        if self._instance_shared:
+            print(f"[跳过] 实例「{self.instance_name}」另有同名实例在运行，保留共用配置。")
+            return True
         # 两个信号任一成立都不能静默删除：
         #   ① 文件里确实有用户配置过的内容（只凭 _user_touched 会把上次选择保留的实例删掉）；
         #   ② 本次会话动过界面（哪怕只是选了个窗口，也不能当作没发生）

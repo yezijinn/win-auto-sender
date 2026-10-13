@@ -200,6 +200,12 @@ A: The target dropdown stays on the “请选择目标窗口” placeholder by d
 **Q: The log says “config parse failed, read-only protection”?**
 A: That ini has a syntax or encoding problem. The app opens with defaults and **will not write back automatically**, so your original file is preserved; fix the file and restart, or click “💾 保存” to explicitly overwrite with the current content.
 
+**Q: Two windows share the same instance name — what happens?**
+A: They share one config file. When the later window closes it **will not reclaim that config**, so the config in use by the other instance is preserved.
+
+**Q: Do two instances collide when firing at the same time?**
+A: The send critical section is serialized by a process-level mutex, so only one instance clicks and types at a time. If the queue wait exceeds 30 seconds the firing is skipped this round and the reason is written to the run log.
+
 ---
 
 ## 📄 License
