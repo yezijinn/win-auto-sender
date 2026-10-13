@@ -1503,48 +1503,135 @@ class SchedulerWorker(QThread):
 # ═══════════════════════════════════════════════════════════════
 
 MINI_STYLE = """
+/* 迷你窗口是独立顶层窗，不继承主窗口样式表，此处与全局极光蓝主题对齐 */
 QWidget#miniRoot {
-    background-color: #0b1626;
-    border: 1px solid #23406e;
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #101f38, stop:1 #0d1a30);
+    border: 1px solid #1f3560;
 }
-QLabel[class="mini-title"] { color: #dce9ff; font-weight: 700; font-size: 10pt; }
-QLabel[class="mini-meta"]  { color: #7a93c0; font-size: 8.5pt; }
+QLabel {
+    background: transparent;
+    color: #d6e4ff;
+}
+QLabel[class="mini-title"] { color: #e0eeff; font-weight: 700; font-size: 10.5pt; }
+QLabel[class="mini-meta"]  { color: #7a93c0; font-size: 9pt; }
 QLabel[class="mini-chip"] {
     background-color: #0e1c33;
     border: 1px solid #1f3560;
-    border-radius: 9px;
-    padding: 1px 10px;
+    border-radius: 11px;
+    padding: 2px 12px;
     color: #00d4ff;
     font-family: "Consolas", "Courier New", monospace;
-    font-size: 10pt;
+    font-size: 10.5pt;
     font-weight: 700;
 }
 QPushButton[class="mini-icon"] {
-    background: transparent;
-    border: none;
-    color: #7a93c0;
+    background-color: #132547;
+    color: #9cc0ff;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
     font-weight: 700;
-    padding: 0 4px;
+    padding: 0;
 }
-QPushButton[class="mini-icon"]:hover { color: #00d4ff; }
+QPushButton[class="mini-icon"]:hover {
+    background-color: #1a3260;
+    border-color: #3d5d94;
+    color: #c2dbff;
+}
+QPushButton[class="mini-icon"]:pressed { background-color: #0f1e3a; }
+QComboBox, QSpinBox, QDateTimeEdit {
+    background-color: #0e1c33;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+    padding: 4px 10px;
+    min-height: 20px;
+    color: #d6e4ff;
+    selection-background-color: #00b8ff;
+    selection-color: #06101e;
+}
+QComboBox:hover, QSpinBox:hover, QDateTimeEdit:hover { border-color: #00b8ff; }
+QComboBox:focus, QSpinBox:focus, QDateTimeEdit:focus {
+    border-color: #00d4ff;
+    background-color: #122647;
+}
+QComboBox::drop-down, QDateTimeEdit::drop-down { border: none; width: 24px; }
+QComboBox QAbstractItemView {
+    background: #122647;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+    padding: 4px;
+    color: #d6e4ff;
+    selection-background-color: #1f3d7a;
+    selection-color: #ffffff;
+    outline: 0;
+}
+QCalendarWidget { background-color: #122647; color: #d6e4ff;
+    selection-background-color: #00b8ff; selection-color: #06101e; }
+QCalendarWidget QToolButton { color: #d6e4ff; background: transparent; border: none; }
+QCalendarWidget QMenu { background: #122647; color: #d6e4ff; }
+QPlainTextEdit, QTextEdit {
+    background-color: #0e1c33;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+    padding: 6px;
+    color: #d6e4ff;
+    selection-background-color: #00b8ff;
+    selection-color: #06101e;
+}
+QPlainTextEdit:focus, QTextEdit:focus { border-color: #00d4ff; background-color: #122647; }
+QScrollBar:vertical { background: transparent; width: 8px; margin: 4px 0; }
+QScrollBar::handle:vertical { background: #1f3560; border-radius: 4px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: #3d5d94; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QPushButton[class="mini-start"] {
-    background-color: #14456b;
-    color: #d9f1ff;
-    border: 1px solid #1f6ea0;
-    border-radius: 6px;
-    padding: 6px 10px;
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #00b8ff, stop:1 #3d7bff);
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    padding: 6px 14px;
     font-weight: 600;
+    font-size: 10.5pt;
 }
-QPushButton[class="mini-start"]:hover { background-color: #1a5583; }
+QPushButton[class="mini-start"]:hover {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #00d4ff, stop:1 #5a92ff);
+}
+QPushButton[class="mini-start"]:pressed {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #00a0e0, stop:1 #2a6aff);
+}
 QPushButton[class="mini-stop"] {
-    background-color: #5c2233;
-    color: #ffe3ea;
-    border: 1px solid #8e2f47;
-    border-radius: 6px;
-    padding: 6px 10px;
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #ff6b8a, stop:1 #e84868);
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    padding: 6px 14px;
     font-weight: 600;
+    font-size: 10.5pt;
 }
-QPushButton[class="mini-stop"]:hover { background-color: #73283d; }
+QPushButton[class="mini-stop"]:hover {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #ff8aa3, stop:1 #ff5c7a);
+}
+QPushButton[class="mini-stop"]:pressed {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #e85070, stop:1 #d43a58);
+}
+QPushButton[class="mini-now"] {
+    background-color: #132547;
+    color: #9cc0ff;
+    border: 1px solid #1f3560;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 500;
+}
+QPushButton[class="mini-now"]:hover {
+    background-color: #1a3260;
+    border-color: #3d5d94;
+    color: #c2dbff;
+}
 """
 
 VKBD_STYLE = """
@@ -1555,24 +1642,24 @@ QWidget {
 }
 QWidget#vkbdRoot {
     background-color: #0e1a2e;
-    border: 1px solid #2b4a7d;
+    border: 1px solid #1f3560;
 }
 QLabel { background: transparent; }
 QLabel[class="vkbd-title"] { font-size: 11pt; font-weight: 600; color: #e0eeff; }
 QLabel[class="vkbd-status"] {
-    font-size: 9pt; color: #a8d4ff;
-    background-color: #132347;
-    border: 1px solid #2b4a7d;
+    font-size: 9pt; color: #9cc0ff;
+    background-color: #132547;
+    border: 1px solid #1f3560;
     border-radius: 6px;
     padding: 5px 10px;
 }
 QPushButton[class="vkbd-close"] {
-    background-color: #e5484d; color: #ffffff;
-    border: 1px solid #ff8a8f; border-radius: 6px;
+    background-color: #e84868; color: #ffffff;
+    border: 1px solid #ff6b8a; border-radius: 6px;
     font-size: 14pt; font-weight: 700;
 }
-QPushButton[class="vkbd-close"]:hover { background-color: #ff6169; border-color: #ffb0b4; }
-QPushButton[class="vkbd-close"]:pressed { background-color: #c93b40; border-color: #e5484d; }
+QPushButton[class="vkbd-close"]:hover { background-color: #ff5c7a; border-color: #ff8aa3; }
+QPushButton[class="vkbd-close"]:pressed { background-color: #d43a58; border-color: #e84868; }
 /* class 属性为 "vkbd-key" / "vkbd-key vkbd-key-mod" 多词值，须用 ~= 词匹配 */
 QPushButton[class~="vkbd-key"] {
     background-color: #122038;
@@ -1582,13 +1669,13 @@ QPushButton[class~="vkbd-key"] {
     font-size: 9pt;
 }
 QPushButton[class~="vkbd-key"]:hover { border-color: #00b8ff; color: #ffffff; }
-QPushButton[class~="vkbd-key"]:pressed { background-color: #0a2f4a; color: #ffffff; }
+QPushButton[class~="vkbd-key"]:pressed { background-color: #0f1e3a; color: #ffffff; }
 QPushButton[class~="vkbd-key"]:checked {
     background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00b8ff, stop:1 #3d7bff);
     color: #ffffff;
     border-color: #00b8ff;
 }
-QPushButton[class~="vkbd-key-mod"] { color: #9fc2ff; }
+QPushButton[class~="vkbd-key-mod"] { color: #9cc0ff; }
 """
 
 
@@ -1689,7 +1776,7 @@ class MiniWindow(QWidget):
         self.dt_edit.dateTimeChanged.connect(self._on_time_edited)
         t.addWidget(self.dt_edit, 1)
         self.btn_now = QPushButton("此刻")
-        self.btn_now.setProperty("class", "mini-start")
+        self.btn_now.setProperty("class", "mini-now")
         self.btn_now.setToolTip("把触发时间改为当前时刻")
         self.btn_now.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_now.clicked.connect(self._on_now_clicked)
