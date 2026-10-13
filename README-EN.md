@@ -27,8 +27,8 @@ Works against targets such as OpenCode, VS Code, Windows Terminal, CMD and brows
 | Capability | Description |
 |---|---|
 | 🎯 **Crosshair Drag-To-Aim** | Spy++-style: drag the crosshair onto the target input box and release to bind the window and append that point as a click step |
-| 🖱️ **Click Sequence** | Multiple click points per target, executed in order: custom coordinates (negative coordinates for secondary monitors supported), reorderable (drag / ↑↓) and a **per-step delay in ms** |
-| ⌨️ **Key Sequence** | Keys sent after pasting: `Enter` / `Tab` / `Esc` / `F1`–`F12` / `Ctrl+A` and other single or combined keys, each with its **own delay** |
+| 🖱️ **Click Sequence** | Multiple click points per target, executed in order: custom coordinates (negative coordinates for secondary monitors supported), reorderable (drag / ↑↓) and a **per-step delay in ms** (new steps default to 1000 ms) |
+| ⌨️ **Key Sequence** | Keys sent after pasting: `Enter` / `Tab` / `Esc` / `F1`–`F12` / `Ctrl+A` and other single or combined keys, each with its **own delay** (new steps default to 1000 ms) |
 | 📋 **Paste Switch** | Turn the `Ctrl+V` paste off to send only keystrokes (e.g. shortcut-only actions) |
 | 🧲 **Bypass Focus-Stealing Protection** | `AttachThreadInput` + keyboard-state simulation to overcome background-focus restrictions |
 | 🖥️ **High-DPI Aware** | Native `SetProcessDpiAwareness` — coordinates stay correct at 2K/4K and 125%/150% scaling |
@@ -39,6 +39,9 @@ Works against targets such as OpenCode, VS Code, Windows Terminal, CMD and brows
 | ⏱️ **[Suffix]** | Optional text (collapsible section) sent N seconds after the main message; in loop mode the delay is capped below the interval |
 | ⏰ **Single / Loop Scheduling** | Single fires once then stops; loop sets a minute interval, optional immediate first fire, date-range protection and a live preview of upcoming fire times |
 | 🧩 **Three-Column Settings** | Target + click sequence / schedule / send behaviour side by side, all visible at once; content and the run log below at full width; window size and column widths are remembered |
+| 🗂️ **Collapsible Sections** | Click sequence, key sequence, schedule preview, preface and suffix are all collapsible sections showing step/item counts in the header — long lists cost no screen space |
+| 🪟 **Mini Window** | The toolbar's “🪟 Mini” opens a minimal window with only three things: change time, edit text, stop/resume; dock it against a screen edge to auto-collapse into a thin strip that expands on hover |
+| ✏️ **Custom Program Name** | New windows are named “BaseName-N” (`WindowsLoopSend-2`, `-3` …) and can be renamed to any Chinese/English name; the config file follows the new name |
 | 🪟 **Multi-instance Isolation** | One-click new window manages another target; each instance keeps its own config/content/schedule |
 | 💾 **Config Management** | Auto-save (400 ms debounce) + hot-reload + manual save / import / restore-to-factory, with a live save-state indicator |
 | 🔒 **Lock Input Before Send** | Switch under “send behaviour”: blocks mouse/keyboard ~1 s before each send to avoid conflicts (needs admin rights; silently skipped otherwise) |
@@ -70,21 +73,21 @@ Or simply double-click `dist\WindowsLoopSend.exe` (single file; no Python needed
 ## 🖱️ Layout
 
 ```text
-┌─ Toolbar: status · clock · countdown · save/import/restore/new window ───────────────────┐
+┌─ Toolbar: status · clock · countdown · save/import/restore/new/rename/mini ──────────────┐
 │ ┌─ 🎯 Target + click sequence ─┐ ┌─ ⏰ Schedule ─────────┐ ┌─ ⚙️ Send behaviour ───┐ │
 │ │ crosshair · dropdown · refresh│ │ single / loop         │ │ paste switch · lock   │ │
-│ │ click points: order + delay   │ │ start / end / interval│ │ key sequence: keys    │ │
-│ │ per-step delay (ms)           │ │ immediate + preview   │ │ and combos + delays   │ │
+│ │ ▾ click points: order + delay │ │ start / end / interval│ │ ▾ key sequence: keys  │ │
+│ │ ▾ per-step delay (ms)         │ │ immediate + ▾ preview │ │ ▾ per-step delays    │ │
 │ └───────────────────────────────┘ └───────────────────────┘ └───────────────────────┘ │
 │ ┌─ 📝 Content (full width) ─────────────────────────────────────────────────────────┐ │
-│ │ toolbar: add/dup/del/move/import + strategy ｜ list ｜ editor ｜ preface/suffix     │ │
+│ │ toolbar: add/dup/del/move/import + strategy ｜ list ｜ editor ｜ ▾ preface/suffix   │ │
 │ └──────────────────────────────────────────────────────────────────────────────────┘ │
 │ ▾ Run log (collapsible)                                                               │
 │ Action bar: [▶ Start] [⚡ Test Send]                                      save-state    │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The settings area holds three side-by-side columns (draggable widths, each column scrolls internally); content and the run log sit below at full width. Window size, column widths and section heights are all remembered and restored on the next launch.
+The settings area holds three side-by-side columns (draggable widths, each column scrolls internally); content and the run log sit below at full width. Click sequence, key sequence, schedule preview, preface and suffix are all **▾ collapsible sections** (collapsed headers show step/item counts). The window is **freely resizable** (min 960×620) and remembers its size, column widths, section heights and collapse states.
 
 ## 🖱️ Usage
 
@@ -93,6 +96,17 @@ The settings area holds three side-by-side columns (draggable widths, each colum
 3. **Set trigger**: single fires at a chosen time; loop sets a minute interval, optional immediate first fire and start/end dates, with a live preview of the next fire times.
 4. **Configure send behaviour**: decide whether to **paste the content (Ctrl+V)** and edit the **key sequence** — one `Enter` by default, replaceable with `Tab`, `F5`, `Ctrl+A` and other single or combined keys, each with its own delay.
 5. **Test, then run**: click **⚡ Test Send** first to confirm focus, clicks, paste and keys all land correctly, then **▶ Start** to keep it running.
+
+---
+
+## 🪟 Mini Window
+
+Click **“🪟 Mini”** in the toolbar to open a minimal window that keeps only three things — **change time / edit text / stop-resume** — so it can stay parked in a screen corner.
+
+- **Change time**: edit the fire time directly (the single-task time, or the loop start time), or click “Now” to fill in the current moment.
+- **Edit text**: switch items with the dropdown and edit the text in place; changes are written back to the main window and saved immediately.
+- **Stop / resume**: the status line shows the live state, countdown and next fire time, with a one-click **⏹ Stop / ▶ Resume**.
+- **QQ-style edge docking**: drag it against the left/right screen edge to snap; close to the edge it auto-collapses into a thin strip that expands on mouse hover and collapses again when you leave. Top/bottom edges snap without collapsing. Position and docking state are remembered.
 
 ---
 
@@ -108,7 +122,9 @@ Click **📂 Import** in the content workspace to load `发送内容.txt` / `发
 
 ## 🪟 Multi-Window / Multi-Target
 
-Click **“🆕 New Window”** in the toolbar to open a fully independent instance — **separate process + separate config file** (`config-<name>-win-auto-sender.ini`). Prompts, preface/suffix, schedule and target are all independent per instance.
+Click **“🆕 New Window”** in the toolbar to open a fully independent instance — **separate process + separate config file** (`config-win-auto-sender-<name>.ini`). Prompts, preface/suffix, schedule and target are all independent per instance.
+
+New windows are named **“BaseName-N”**: `WindowsLoopSend-2`, `WindowsLoopSend-3` … (the smallest free number is picked, so naming never collides). Click **“✏️ Rename”** in the toolbar to give it any Chinese/English name (≤48 chars, limited to letters, digits, `_`, `-` and Chinese characters) — the **config file is migrated to the new name** and the window title updates instantly. Renaming the default window is remembered, so the next launch without arguments reuses that name.
 
 <p align="center">
   <img src="docs/双开程序.png" alt="Multi-window example" width="760"/>
@@ -120,10 +136,10 @@ Click **“🆕 New Window”** in the toolbar to open a fully independent insta
 
 ## 💾 Config Management
 
-- Config file: `config-win-auto-sender.ini` (same folder as the exe).
+- Config file: `config-win-auto-sender.ini` for the default window, `config-win-auto-sender-<name>.ini` for other instances (all next to the exe); renaming an instance migrates its config file automatically.
 - UI changes auto-save with a **400 ms debounce**; editing the file externally **hot-syncs** back to the UI; the bottom bar shows a live “unsaved / saved at” state.
 - Toolbar provides **💾 Save / 📥 Import / ♻️ Restore-to-factory**; import & restore are blocked while a task is running.
-- Window size, section heights and log visibility are remembered separately — they never pollute the ini config.
+- Window size, section heights, log visibility, section collapse states and mini-window position are remembered separately — they never pollute the ini config.
 
 <p align="center">
   <img src="docs/关闭程序.png" alt="Close-window config recycle prompt" width="560"/>
