@@ -40,7 +40,7 @@ Works against targets such as OpenCode, VS Code, Windows Terminal, CMD and brows
 | ⏰ **Single / Loop Scheduling** | Single fires once then stops; loop sets a minute interval, optional immediate first fire, date-range protection and a live preview of upcoming fire times |
 | 🧩 **Three-Column Settings** | Target + click sequence / schedule / send behaviour side by side, all visible at once; content and the run log below at full width; window size and column widths are remembered |
 | 🗂️ **Collapsible Sections** | Click sequence, key sequence, schedule preview, preface and suffix are all collapsible sections showing step/item counts in the header — long lists cost no screen space |
-| 🪟 **Mini Window** | The toolbar's “🪟 Mini” opens a minimal window with only three things: change time, edit text, stop/resume; dock it against a screen edge to auto-collapse into a thin strip that expands on hover |
+| 🪟 **Mini Window** | The toolbar's “🪟 Mini” opens a minimal window with only three things: change time, edit text, stop/resume; dock it against a screen edge to auto-collapse into a thin strip that expands on hover; mutually exclusive with the main window — only one is shown at a time |
 | ✏️ **Custom Program Name** | New windows are named “BaseName-N” (`WindowsLoopSend-2`, `-3` …) and can be renamed to any Chinese/English name; the config file follows the new name |
 | 🪟 **Multi-instance Isolation** | One-click new window manages another target; each instance keeps its own config/content/schedule |
 | 💾 **Config Management** | Auto-save (400 ms debounce) + hot-reload + manual save / import / restore-to-factory, with a live save-state indicator |
@@ -107,6 +107,7 @@ Click **“🪟 Mini”** in the toolbar to open a minimal window that keeps onl
 - **Edit text**: switch items with the dropdown and edit the text in place; changes are written back to the main window and saved immediately.
 - **Stop / resume**: the status line shows the live state, countdown and next fire time, with a one-click **⏹ Stop / ▶ Resume**.
 - **QQ-style edge docking**: drag it against the left/right screen edge to snap; close to the edge it auto-collapses into a thin strip that expands on mouse hover and collapses again when you leave. Top/bottom edges snap without collapsing. Position and docking state are remembered.
+- **Exclusive with the main window**: opening the mini window hides the main window, and closing the mini window via its **↗** or **✕** button restores the main window — only one is shown at a time.
 
 ---
 

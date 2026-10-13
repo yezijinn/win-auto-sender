@@ -1506,7 +1506,6 @@ MINI_STYLE = """
 QWidget#miniRoot {
     background-color: #0b1626;
     border: 1px solid #23406e;
-    border-radius: 10px;
 }
 QLabel[class="mini-title"] { color: #dce9ff; font-weight: 700; font-size: 10pt; }
 QLabel[class="mini-meta"]  { color: #7a93c0; font-size: 8.5pt; }
@@ -1619,7 +1618,6 @@ class MiniWindow(QWidget):
 
         self.setObjectName("miniRoot")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setWindowTitle("迷你窗口 · " + main.display_name())
         self.setFixedWidth(self.WIDTH)
         self.setStyleSheet(MINI_STYLE)
@@ -1658,9 +1656,9 @@ class MiniWindow(QWidget):
         self.btn_close = QPushButton("✕")
         self.btn_close.setProperty("class", "mini-icon")
         self.btn_close.setFixedSize(22, 22)
-        self.btn_close.setToolTip("收起迷你窗口（主窗口不受影响）")
+        self.btn_close.setToolTip("收起迷你窗口并恢复主窗口")
         self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_close.clicked.connect(self.hide)
+        self.btn_close.clicked.connect(self._close_to_main)
         top.addWidget(self.btn_close)
         v.addLayout(top)
 
@@ -1829,6 +1827,11 @@ class MiniWindow(QWidget):
         self.sync_from_main()
 
     def _show_main(self):
+        self.main._show_main_window()
+
+    def _close_to_main(self):
+        """收起迷你窗口并恢复主窗口（两者互斥）。"""
+        self.hide()
         self.main._show_main_window()
 
     # ── 边缘停靠 / 自动收起 ─────────────────────────────────
@@ -4082,22 +4085,29 @@ class MainWindow(QMainWindow):
         self._append_log("✏️  程序名称已改为「%s」，配置文件：%s" % (self.display_name(), os.path.basename(new_file)))
 
     def _toggle_mini(self):
-        """打开 / 收起迷你窗口（极简模式：改时间、改内容、停止继续）。"""
+        """打开 / 收起迷你窗口（极简模式：改时间、改内容、停止继续）。
+
+        迷你窗口与主窗口互斥：打开迷你即收起主窗口，收起迷你即恢复主窗口。
+        """
         if self._closing:
             return
         if self._mini is None:
             self._mini = MiniWindow(self)
             self._mini.apply_saved_state(self._mini_state)
-            self._mini.show()
-        elif self._mini.isVisible():
+        if self._mini.isVisible():
             self._mini.hide()
+            self._show_main_window()
         else:
+            self.hide()
             self._mini.show()
             self._mini.raise_()
         self._sync_mini()
         self._append_log("🪟 迷你窗口已" + ("打开。" if self._mini.isVisible() else "收起。"))
 
     def _show_main_window(self):
+        """显示并激活主窗口；主窗口与迷你窗口互斥，显示主窗口即收起迷你。"""
+        if self._mini is not None and self._mini.isVisible():
+            self._mini.hide()
         self.showNormal()
         self.raise_()
         self.activateWindow()
