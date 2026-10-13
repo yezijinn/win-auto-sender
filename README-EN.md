@@ -194,6 +194,12 @@ A: Re-drag the crosshair onto the center of the input box and make sure `X/Y` co
 **Q: Does firing interfere with what I'm doing?**
 A: It foregrounds, focuses and simulates key/mouse at trigger time (~0.3–0.5 s) then returns to the background; optionally lock input before send to avoid conflicts.
 
+**Q: Why is “Start” blocked on a brand-new window before a target is picked?**
+A: The target dropdown stays on the “请选择目标窗口” placeholder by default; without a real window bound, Start is refused so content can never be sent to an unintended program.
+
+**Q: The log says “config parse failed, read-only protection”?**
+A: That ini has a syntax or encoding problem. The app opens with defaults and **will not write back automatically**, so your original file is preserved; fix the file and restart, or click “💾 保存” to explicitly overwrite with the current content.
+
 ---
 
 ## 📄 License

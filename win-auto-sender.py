@@ -221,11 +221,13 @@ def load_config_file(path=None):
         except Exception:
             cfg['load_warnings'] = ["配置文件的编码无法识别（既不是 UTF-8 也不是 GBK），"
                                     "已按默认配置打开；原文件未被改写"]
+            cfg['read_only'] = True     # 解析失败：调用方进入只读保护，禁止静默写回覆盖原文件
             return cfg
     except Exception:
         # 语法错误等：保留提示，避免用户以为"配置莫名其妙全空了"还把它写回去
         cfg['load_warnings'] = ["配置文件解析失败，已按默认配置打开；"
                                 "原文件未被改写，请检查该 ini 的语法"]
+        cfg['read_only'] = True
         return cfg
 
     if parser.has_section('general'):
@@ -597,6 +599,8 @@ def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
             pass
         if blocked:
             time.sleep(1.0)
+        elif lock_input:
+            print("[提示] 未能锁定鼠标键盘（通常因未以管理员权限运行），本次发送未启用锁定。")
 
         # 前台激活失败的处理：有点击序列时继续（点击本身通常会把目标带到前台），
         # 没有点击序列时中止本次发送，避免内容落到当前真正的前台窗口
@@ -631,7 +635,8 @@ def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
             time.sleep(0.05)
             win32api.keybd_event(ord('V'), 0, win32con.KEYEVENTF_KEYUP, 0)
             win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.15)
+            # 长文本粘贴到慢目标需要更久：按内容长度给出宽限，避免后续按键先于粘贴完成到达
+            time.sleep(0.15 + min(0.85, len(text or '') / 40000.0))
 
         # 按键序列：默认一条回车，可换成任意按键组合
         key_list = list(key_steps or [])
@@ -669,13 +674,24 @@ def click_and_paste_send(hwnd, text, click_steps=None, key_steps=None,
 
 
 def list_all_windows():
-    """返回 [(title, hwnd), ...] 可见窗口列表"""
+    """返回 [(title, hwnd), ...] 可见窗口列表；排除本程序自身与桌面外壳窗口。"""
     windows = []
+    own_pid = kernel32.GetCurrentProcessId()
+    shell_classes = {'Progman', 'Shell_TrayWnd', 'WorkerW', 'SysShadow'}
     def enum_cb(hwnd, extra):
-        if win32gui.IsWindowVisible(hwnd):
-            txt = win32gui.GetWindowText(hwnd)
-            if txt.strip():
-                windows.append((txt, hwnd))
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+        try:
+            # 排除本程序自身与外壳窗口：既避免误选自己为目标，也避免列表被系统窗口污染
+            if win32gui.GetClassName(hwnd) in shell_classes:
+                return True
+            if win32process.GetWindowThreadProcessId(hwnd)[1] == own_pid:
+                return True
+        except Exception:
+            pass
+        txt = win32gui.GetWindowText(hwnd)
+        if txt.strip():
+            windows.append((txt, hwnd))
         return True
     win32gui.EnumWindows(enum_cb, None)
     windows.sort(key=lambda x: x[0].lower())
@@ -1222,9 +1238,12 @@ class CheckIndicatorStyle(QProxyStyle):
         partial = bool(state & QStyle.StateFlag.State_NoChange)
         enabled = bool(state & QStyle.StateFlag.State_Enabled)
         hover = bool(state & QStyle.StateFlag.State_MouseOver)
+        focus = bool(state & QStyle.StateFlag.State_HasFocus)
 
         size = float(self.BOX)
-        center = option.rect.center()
+        # 用几何中心而非 QRect.center()：后者对偶数宽取整数除，返回点偏左上约 1px
+        center = QPointF(option.rect.x() + option.rect.width() / 2.0,
+                         option.rect.y() + option.rect.height() / 2.0)
         box = QRectF(center.x() - size / 2.0, center.y() - size / 2.0, size, size)
 
         painter.save()
@@ -1255,6 +1274,11 @@ class CheckIndicatorStyle(QProxyStyle):
             border = QColor('#00b8ff') if hover else (QColor('#4a6d9e') if enabled else QColor('#31456a'))
             painter.setPen(QPen(border, 1.8))
             painter.drawRoundedRect(box.adjusted(0.9, 0.9, -0.9, -0.9), 5.0, 5.0)
+        if focus:
+            # 键盘聚焦提示：外圈虚线框（自绘指示器不走默认焦点绘制，否则键盘用户看不出焦点位置）
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor('#8fe6ff'), 1.4, Qt.PenStyle.DashLine))
+            painter.drawRoundedRect(box.adjusted(-2.4, -2.4, 2.4, 2.4), 6.0, 6.0)
         painter.restore()
 
 
@@ -1286,6 +1310,21 @@ class WheelGuard(QObject):
         except Exception as e:
             print(f"[滚轮转发失败] {e}")
         return True
+
+
+# ═══════════════════════════════════════════════════════════════
+#  内容列表控件
+# ═══════════════════════════════════════════════════════════════
+
+class PromptListWidget(QListWidget):
+    """发送内容列表。内部拖拽排序走 MIME 路径（发 rowsInserted / rowsRemoved，
+    不会发 rowsMoved），故在拖放结束后主动发信号，交由窗口重编号并落盘。"""
+
+    dropped = Signal()
+
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        self.dropped.emit()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1375,8 +1414,10 @@ class TestSendThread(QThread):
 
     def run(self):
         try:
+            # 传入中断通道：关窗前会 requestInterruption，让发送在等锁/等待间隔时及时退出，
+            # 避免关窗等待超时后进程仍在发送中途退出、目标窗口留下半截内容
             ok = click_and_paste_send(self.hwnd, self.text, self.click_steps, self.key_steps,
-                                      self.paste, self.lock_input)
+                                      self.paste, self.lock_input, self.isInterruptionRequested)
         except Exception:
             ok = False
         self.done_signal.emit(ok)
@@ -1410,15 +1451,30 @@ class SchedulerWorker(QThread):
         self.prompt_index = (self.prompt_index + 1) % len(self.prompts)
         return p
 
-    def _next_fire(self, last_fire):
-        mode = self.config['mode']
-        if mode == 'single':
-            return None
-        interval = datetime.timedelta(minutes=self.config['interval_min'])
-        nxt = last_fire + interval
-        if nxt > self.config['end_dt']:
-            return None
-        return nxt
+    def _target_valid(self):
+        """每次触发前复核目标窗口：句柄有效 **且** 进程与窗口类名与启动时一致。
+
+        仅用 IsWindow 无法识别"目标进程已退出、句柄被系统复用给新窗口"的情况，
+        那样内容会持续发到无关窗口，故引入 pid + 类名指纹比对。
+        """
+        hwnd = self.config.get('hwnd')
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return False
+        pid = self.config.get('target_pid')
+        if pid:
+            try:
+                if win32process.GetWindowThreadProcessId(hwnd)[1] != pid:
+                    return False
+            except Exception:
+                return False
+        cls = self.config.get('target_class')
+        if cls:
+            try:
+                if win32gui.GetClassName(hwnd) != cls:
+                    return False
+            except Exception:
+                return False
+        return True
 
     def run(self):
         hwnd = self.config['hwnd']
@@ -1457,6 +1513,10 @@ class SchedulerWorker(QThread):
         while not self.isInterruptionRequested():
             now = datetime.datetime.now()
             if now >= next_fire:
+                # 目标窗口指纹复核：进程退出后句柄可能被复用给新窗口，仅 IsWindow 查不出来
+                if not self._target_valid():
+                    self.log_signal.emit("⚠️  目标窗口已失效或已被其它窗口复用，任务中止。")
+                    break
                 self.log_signal.emit("⏰ 触发 — 正在聚焦并发送...")
                 ok = click_and_paste_send(hwnd, compose_send_text(self.preface, self.pick_prompt()),
                                           self.click_steps, self.key_steps, self.paste,
@@ -1474,14 +1534,25 @@ class SchedulerWorker(QThread):
                         time.sleep(min(0.2, remaining))
                         remaining -= 0.2
                     if not self.isInterruptionRequested():
-                        ok2 = click_and_paste_send(hwnd, self.suffix, self.click_steps, self.key_steps,
-                                                   self.paste, self.lock_input, self.isInterruptionRequested)
-                        self.log_signal.emit("✅ 追加后续已发送。" if ok2 else "❌ 追加后续发送失败。")
+                        if not self._target_valid():
+                            self.log_signal.emit("⚠️  目标窗口已失效，已跳过追加后续。")
+                        else:
+                            ok2 = click_and_paste_send(hwnd, self.suffix, self.click_steps, self.key_steps,
+                                                       self.paste, self.lock_input, self.isInterruptionRequested)
+                            self.log_signal.emit("✅ 追加后续已发送。" if ok2 else "❌ 追加后续发送失败。")
 
-                # 以实际完成时刻作为下一调度基线：若主发送+追加后续耗时较长，
-                # 可避免 next_fire 仍落在过去导致背靠背二次发送
-                now = datetime.datetime.now()
-                next_fire = self._next_fire(now)
+                # 按绝对网格推进下一次触发：与预览 compute_fire_list 同一口径。
+                # 本次发送耗时较长时跳过已经过去的网格点（不背靠背补发），
+                # 从而让实际触发次数与预览列表一致。
+                if mode == 'single':
+                    next_fire = None
+                else:
+                    interval = datetime.timedelta(minutes=self.config['interval_min'])
+                    now = datetime.datetime.now()
+                    nxt = next_fire + interval
+                    while nxt <= now:
+                        nxt += interval
+                    next_fire = nxt if nxt <= end_dt else None
                 if next_fire is None:
                     self.log_signal.emit("🏁 全部任务已完成，调度结束。")
                     break
@@ -2337,6 +2408,8 @@ class MainWindow(QMainWindow):
         self._wheel_guard = WheelGuard(self)   # 数值框滚轮守卫：未聚焦时不吃滚轮
         self._closing = False                  # 关闭流程中：屏蔽发送类操作，避免等待期事件重入
         self._last_self_write = None           # 最近一次自写盘指纹 (mtime_ns, size)，用于识别"这份文件是我写的"
+        self._read_only = False                # 原配置解析失败时置位：只读保护，禁止静默写回覆盖原文件
+        self._pending_reload = False           # 任务运行期间收到外部改动：停止后补做一次热更新
 
         self._setup_style()
         self._init_ui()
@@ -2430,7 +2503,7 @@ class MainWindow(QMainWindow):
         self.split_v.addWidget(self._build_content_panel())
         self.log_panel = self._build_log_panel()
         self.split_v.addWidget(self.log_panel)
-        self.split_v.setStretchFactor(0, 0)
+        self.split_v.setStretchFactor(0, 1)
         self.split_v.setStretchFactor(1, 1)
         self.split_v.setStretchFactor(2, 0)
         self.split_v.setSizes([390, 330, 120])
@@ -2515,7 +2588,8 @@ class MainWindow(QMainWindow):
             col = QScrollArea()
             col.setWidgetResizable(True)
             col.setFrameShape(QFrame.Shape.NoFrame)
-            col.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            # 列为内容最小宽以下时出现横向滚动条：给被压窄的列一个可发现的操作入口
+            col.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             col.setWidget(holder)
             self.split_set.addWidget(col)
 
@@ -2961,7 +3035,7 @@ class MainWindow(QMainWindow):
         entry = {}
         frame, row = self._step_row()
         num = QLabel("")
-        num.setFixedWidth(16)
+        num.setFixedWidth(24)
         num.setProperty("class", "meta")
         sp_x = QSpinBox()
         sp_x.setRange(-32767, 32767)
@@ -3006,7 +3080,7 @@ class MainWindow(QMainWindow):
         entry = {}
         frame, row = self._step_row()
         num = QLabel("")
-        num.setFixedWidth(16)
+        num.setFixedWidth(24)
         num.setProperty("class", "meta")
         edit = QLineEdit(str(key))
         edit.setPlaceholderText("如 Enter / Tab / Ctrl+A / F5（加号写 plus）")
@@ -3153,7 +3227,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(tb)
 
         # ── 主体：内容列表 ｜ 编辑区（可拖拽分隔） ──
-        self.prompt_list = QListWidget()
+        self.prompt_list = PromptListWidget()
         self.prompt_list.setProperty("class", "prompt-list")
         self.prompt_list.setMinimumWidth(230)
         # 摘要超长时省略号截断，不出现横向滚动条（完整首行与字数见条目提示）
@@ -3163,6 +3237,8 @@ class MainWindow(QMainWindow):
         self.prompt_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.prompt_list.setToolTip("选中一条后即可在右侧编辑；可直接拖拽调整顺序")
         self.prompt_list.currentRowChanged.connect(self._on_prompt_row_changed)
+        # 拖拽排序走 MIME 路径不发 rowsMoved，故额外监听 dropEvent 后的 dropped 信号
+        self.prompt_list.dropped.connect(self._on_prompt_rows_moved)
         self.prompt_list.model().rowsMoved.connect(self._on_prompt_rows_moved)
 
         self.prompt_edit = QPlainTextEdit()
@@ -3472,7 +3548,8 @@ class MainWindow(QMainWindow):
             # 旧键保留：仅记录首个点击点，便于旧版本或外部工具仍能读到坐标
             'click_x': self.click_steps[0]['x'].value() if self.click_steps else 0,
             'click_y': self.click_steps[0]['y'].value() if self.click_steps else 0,
-            'window_title': self.win_combo.currentText(),
+            # 未选择真实目标时存空串，避免把占位提示文字写进配置
+            'window_title': self.win_combo.currentText() if self.win_combo.currentData() else '',
             'single_dt': self._combine_dt(self.single_dt),
             'loop_start_dt': self._combine_dt(self.loop_start_dt),
             'loop_end_dt': self._combine_dt(self.loop_end_dt),
@@ -3482,13 +3559,25 @@ class MainWindow(QMainWindow):
             'prompts': self.get_prompt_list(),
         }
 
-    def _persist(self):
-        """把当前 UI 状态写入 ini。写盘前先临时摘除 watcher 防止热更新自触发。"""
+    def _persist(self, force=False):
+        """把当前 UI 状态写入 ini，返回是否写入成功。
+
+        写盘前先临时摘除 watcher 防止热更新自触发；原配置文件解析失败时进入只读保护，
+        除非显式 force（用户已确认覆盖），否则不写回，避免把默认值覆盖掉用户原文件。
+        """
+        if getattr(self, '_read_only', False) and not force:
+            self._dirty = True
+            if hasattr(self, 'lbl_save_state'):
+                self.lbl_save_state.setText("● 只读保护")
+            self._append_log("🔒  配置文件解析失败，已进入只读保护：本次未写回，"
+                             "以免覆盖原文件；修复原文件后重开，或点「💾 保存」确认覆盖。")
+            return False
         try:
             if self._watcher:
                 self._watcher.removePath(self._config_file)
         except Exception:
             pass
+        ok = True
         try:
             save_config_file({'general': self._collect_persist_dict()}, self._config_file)
             self._dirty = False
@@ -3497,6 +3586,7 @@ class MainWindow(QMainWindow):
                 self.lbl_save_state.setText("已保存 " + datetime.datetime.now().strftime('%H:%M:%S'))
         except Exception as e:
             # 写盘失败：保持 dirty，避免误判已保存而失去对未落盘编辑的保护
+            ok = False
             self._dirty = True
             if hasattr(self, 'lbl_save_state'):
                 self.lbl_save_state.setText("● 保存失败")
@@ -3507,6 +3597,7 @@ class MainWindow(QMainWindow):
                     self._watcher.addPath(self._config_file)
             except Exception:
                 pass
+        return ok
 
     def _remember_self_write(self):
         """记录刚写盘文件的指纹，供热更新识别"这份文件就是我自己写的"。"""
@@ -3530,6 +3621,11 @@ class MainWindow(QMainWindow):
     def _apply_config(self, cfg):
         """把加载到的配置应用到 UI（热更新入口也用）。"""
         self._set_loading_flag(True)
+        # 原文件解析失败 → 只读保护，禁止自动写回覆盖（导入 / 恢复出厂 / 手动保存可显式解除）
+        self._read_only = bool(cfg.get('read_only'))
+        if self._read_only:
+            self._append_log("🔒  配置文件解析失败，已进入只读保护：不会自动写回以免覆盖原文件；"
+                             "可在修复原文件后重开，或点「💾 保存」确认覆盖。")
 
         if cfg.get('mode') == 'loop':
             self._set_mode("loop")
@@ -3605,7 +3701,10 @@ class MainWindow(QMainWindow):
         if self._is_loading():
             return
         if self.worker and self.worker.isRunning():
-            self._append_log("⚠️  检测到配置文件改动，任务运行中，待停再同步 UI。")
+            # 任务运行中不立即热更新（运行用启动快照）——但不能永久丢弃：
+            # 置标志，等任务结束由 _on_worker_finished 补做一次同步
+            self._pending_reload = True
+            self._append_log("⚠️  检测到配置文件改动，任务运行中，将在任务结束后同步 UI。")
             return
         # 防抖
         if not hasattr(self, '_reload_timer'):
@@ -3680,6 +3779,9 @@ class MainWindow(QMainWindow):
         stale = False
         try:
             self.win_combo.clear()
+            # 首位固定放占位项（先插入，保证全新实例的当前选中就是它，不会被 Qt 自动
+            # 选中到第一个真实窗口；currentData() 为 None 会在启动/测试时被明确拦下）
+            self.win_combo.addItem("请选择目标窗口", None)
             for title, hwnd in list_all_windows():
                 self.win_combo.addItem(f"{title}", hwnd)
 
@@ -3710,6 +3812,14 @@ class MainWindow(QMainWindow):
     def _on_target_captured(self, hwnd, x, y, title):
         if not hwnd:
             self._append_log("⚠️  未捕获到有效窗口，请把准星拖到目标窗口内部再松开。")
+            return
+        # 拒绝把本程序自身设为目标：否则发送时会激活自己并在自身界面上真实点击
+        try:
+            captured_pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+        except Exception:
+            captured_pid = 0
+        if captured_pid == kernel32.GetCurrentProcessId():
+            self._append_log("⚠️  捕获到的是本程序自身窗口，已忽略；请把准星拖到目标程序窗口上。")
             return
 
         idx = -1
@@ -3905,8 +4015,11 @@ class MainWindow(QMainWindow):
         if not (self.worker and self.worker.isRunning()):
             mode = "single" if self.btn_seg_single.property("active") else "loop"
             if mode == "single":
+                # 单次预览只在"即将触发 / 已过去"边界翻转时重建，避免每秒全量重建
                 fd = self._combine_dt(self.single_dt)
-                key = "s:%s:%s" % (fd.strftime("%Y%m%d%H%M%S"), now.strftime("%Y%m%d%H%M%S"))
+                past = fd < now - datetime.timedelta(seconds=PAST_TOLERANCE_SEC)
+                imminent = fd <= now
+                key = "s:%s:%s:%s" % (fd.strftime("%Y%m%d%H%M%S"), past, imminent)
             else:
                 key = "l:%s:%s:%s:%s:%s" % (
                     self._combine_dt(self.loop_start_dt).strftime("%Y%m%d%H%M%S"),
@@ -4056,8 +4169,20 @@ class MainWindow(QMainWindow):
                                 % '、'.join(bad_keys))
             return None
 
+        # 记录目标窗口指纹（pid + 类名）：运行期每次触发前比对，识别句柄被复用的情况
+        try:
+            target_pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+        except Exception:
+            target_pid = 0
+        try:
+            target_class = win32gui.GetClassName(hwnd)
+        except Exception:
+            target_class = ''
+
         return {
             'hwnd': hwnd,
+            'target_pid': target_pid,
+            'target_class': target_class,
             'prompts': prompts,
             'strategy': 'random' if self.combo_strategy.currentIndex() == 1 else 'sequence',
             'click_steps': self._get_click_steps(),
@@ -4243,6 +4368,12 @@ class MainWindow(QMainWindow):
 
     # ── 任务控制 ─────────────────────────────────────────────
 
+    def _warn_lock_input_unavailable(self):
+        """勾选了「锁定鼠标键盘」但未提权：BlockInput 不会生效，明确告知而不是静默失效。"""
+        if self.chk_lock_input.isChecked() and not is_admin():
+            self._append_log("⚠️  已勾选「发送前锁定鼠标键盘」，但当前未以管理员权限运行，"
+                             "锁定不会生效；如需锁定请以管理员身份重启本程序。")
+
     def toggle_task(self):
         if self._closing:
             return
@@ -4267,6 +4398,7 @@ class MainWindow(QMainWindow):
         cfg = self._collect_config()
         if not cfg:
             return
+        self._warn_lock_input_unavailable()
 
         self.worker = SchedulerWorker(cfg)
         self.worker.log_signal.connect(self._append_log)
@@ -4303,6 +4435,10 @@ class MainWindow(QMainWindow):
             self.next_fire_time = None
             if not self._is_loading():
                 self._refresh_schedule_preview()
+            # 运行期间收到过外部改动：此时任务已结束，补做一次热更新
+            if self._pending_reload:
+                self._pending_reload = False
+                self._reload_from_disk()
 
     def _on_next_fire(self, nxt):
         self.next_fire_time = nxt
@@ -4327,6 +4463,7 @@ class MainWindow(QMainWindow):
         cfg = self._collect_config(for_test=True)
         if not cfg:
             return
+        self._warn_lock_input_unavailable()
         self._append_log("⚡  执行测试发送...")
         prompts = cfg['prompts']
         prompt = random.choice(prompts) if cfg['strategy'] == 'random' else prompts[0]
@@ -4390,6 +4527,8 @@ class MainWindow(QMainWindow):
                 self.worker = None
         tt = getattr(self, '_test_thread', None)
         if tt and tt.isRunning():
+            # 先请求中断：发送函数在等锁/等待间隔时会据此及时退出，避免超时后仍在发送中途退出
+            tt.requestInterruption()
             # 测试发送内含最长约 30s 的发送互斥等待，轮询等待其结束，避免孤儿线程残留
             waited = 0
             while tt.isRunning() and waited < 35000:
@@ -4497,8 +4636,22 @@ class MainWindow(QMainWindow):
 
     def _save_config_now(self):
         """手动立即保存当前配置到本地配置文件（替代仅靠防抖后台保存）。"""
-        self._persist()
-        self._append_log(f"💾 已保存配置：{self._config_file}")
+        force = False
+        if getattr(self, '_read_only', False):
+            reply = QMessageBox.question(
+                self, "覆盖只读配置",
+                "原配置文件解析失败，当前处于只读保护，未自动写回。\n"
+                "是否用当前界面内容覆盖写入该配置文件？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            force = True
+        if self._persist(force=force):
+            if force:
+                self._read_only = False
+            self._append_log(f"💾 已保存配置：{self._config_file}")
+        else:
+            self._append_log(f"❌ 保存失败：无法写入 {self._config_file}")
 
     def _import_config_file(self):
         """从用户选择的 ini 文件导入配置到当前窗口，并覆盖当前窗口的配置文件。"""
@@ -4519,8 +4672,12 @@ class MainWindow(QMainWindow):
             return
         self._apply_config(cfg)
         self._user_touched = True   # 导入是用户显式动作，须防止附属窗口关闭时被当作未使用实例清空
-        self._persist()
-        self._append_log(f"✅ 已从 {path} 导入配置到当前窗口。")
+        # 导入是显式覆盖当前配置文件的意图：解除只读保护后按结果提示
+        self._read_only = False
+        if self._persist():
+            self._append_log(f"✅ 已从 {path} 导入配置到当前窗口。")
+        else:
+            self._append_log(f"❌ 导入后写入失败：{self._config_file}")
 
     def _reset_factory_config(self):
         """把当前窗口配置恢复为出厂默认（清空发送内容、重置全部参数）。"""
@@ -4557,8 +4714,12 @@ class MainWindow(QMainWindow):
             'prompts': [''],
         }
         self._apply_config(default_cfg)
-        self._persist()
-        self._append_log("♻️  已恢复出厂默认配置。")
+        # 恢复出厂是显式覆盖意图：解除只读保护后写回默认配置
+        self._read_only = False
+        if self._persist():
+            self._append_log("♻️  已恢复出厂默认配置。")
+        else:
+            self._append_log(f"❌ 恢复出厂后写入失败：{self._config_file}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4579,9 +4740,11 @@ if __name__ == '__main__':
         if valid_instance_name(remembered) and os.path.exists(default_config_file(remembered)):
             instance_name = remembered
     # 实例名白名单校验，防路径穿越（../ 或含 / \ .. 等绕过 exe 同级目录）
+    name_fallback = False
     if instance_name and not valid_instance_name(instance_name):
         print(f"[忽略] 非法实例名「{instance_name}」，已回退为默认实例。")
         instance_name = ''
+        name_fallback = True
 
     app = QApplication(sys.argv)
     app.setStyle(CheckIndicatorStyle(QStyleFactory.create('Fusion')))
@@ -4589,4 +4752,8 @@ if __name__ == '__main__':
     app.setFont(font)
     win = MainWindow(instance_name)
     win.show()
+    if name_fallback:
+        # 打包后 console=False，stdout 用户看不到：非法名回退必须写进运行日志
+        win._append_log("⚠️  启动参数中的实例名不合法（仅允许中英文、数字、下划线、短横线，≤48 字符），"
+                        "已回退为默认实例。")
     sys.exit(app.exec())
