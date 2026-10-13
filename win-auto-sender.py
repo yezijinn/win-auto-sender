@@ -1571,6 +1571,7 @@ class MiniWindow(QWidget):
 
         self.setObjectName("miniRoot")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setWindowTitle("迷你窗口 · " + main.display_name())
         self.setFixedWidth(self.WIDTH)
         self.setStyleSheet(MINI_STYLE)
@@ -1905,6 +1906,7 @@ class MiniWindow(QWidget):
         if self.collapsed:
             self._expand()
         if self._drag_allowed(event.position().toPoint()):
+            self._anim.stop()      # 拖拽接管位置，停掉可能仍在跑的展开动画，避免争抢抖动
             self._drag_from = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
             return
@@ -3428,10 +3430,21 @@ class MainWindow(QMainWindow):
         """编辑区改动 → 实时回写当前条目（摘要/统计/配置同步更新）。"""
         if self._prompt_loading:
             return
+        text = self.prompt_edit.toPlainText()
         item = self.prompt_list.currentItem()
         if item is None:
-            return
-        text = self.prompt_edit.toPlainText()
+            # 点击列表空白区会清除选中：回写第一条并恢复选中，避免输入被静默丢弃
+            if self.prompt_list.count() == 0:
+                return
+            self.prompt_list.setCurrentRow(0)
+            item = self.prompt_list.item(0)
+            if item is None:
+                return
+            self._prompt_loading = True
+            try:
+                self.prompt_edit.setPlainText(text)
+            finally:
+                self._prompt_loading = False
         item.setData(Qt.ItemDataRole.UserRole, text)
         self._apply_prompt_item(item, self.prompt_list.currentRow() + 1)
         self._update_prompt_count()
@@ -3679,9 +3692,9 @@ class MainWindow(QMainWindow):
             self._mini.refresh_title()
 
     def _next_instance_name(self):
-        """新实例名：程序基名 + 递增序号（WindowsLoopSend-2、WindowsLoopSend-3 …）。
+        """新实例名：程序基名 + 最小可用序号（WindowsLoopSend-2、WindowsLoopSend-3 …）。
 
-        以已存在的同名配置文件为占用依据，序号取最大已用值 +1，避免重开随机名。
+        以已存在的同名配置文件为占用依据，序号从小到大取第一个空位，避免重开随机名。
         """
         pat = re.compile(re.escape(APP_BASE_NAME) + r'-(\d+)$')
         used = set()
@@ -3749,6 +3762,8 @@ class MainWindow(QMainWindow):
         for k in old_settings.allKeys():
             new_settings.setValue(k, old_settings.value(k))
         new_settings.sync()
+        old_settings.clear()      # 清掉旧名称的界面状态，避免序号名日后被复用时继承陈旧状态
+        old_settings.sync()
         # 默认窗口改名后记入启动标记：下次无参数启动仍沿用该名称与配置
         # （附属窗口改名不写该标记，避免抢走默认窗口的启动名称）
         if self._is_default_window:
@@ -3788,7 +3803,25 @@ class MainWindow(QMainWindow):
         """新开一个程序窗口：名称取「程序基名-序号」，独立进程 / 独立配置。"""
         if self._closing:
             return
-        name = self._next_instance_name()
+        # 先写占位配置再启动子进程：子进程要等启动完成才落盘自己的配置文件，
+        # 期间连点「新建」会拿到同一序号，导致两个窗口同名共用一份配置互相覆盖。
+        name = ''
+        target = ''
+        for _ in range(10):
+            name = self._next_instance_name()
+            target = default_config_file(name)
+            try:
+                with open(target, 'x', encoding='utf-8') as f:
+                    f.write('[general]\n')
+                break
+            except FileExistsError:
+                continue
+            except OSError as e:
+                QMessageBox.warning(self, "无法新开窗口", "创建配置文件失败：%s" % e)
+                return
+        else:
+            QMessageBox.warning(self, "无法新开窗口", "未能分配空闲名称，请稍后重试。")
+            return
         if getattr(sys, 'frozen', False):
             args = [sys.executable, "--name", name]
         else:
@@ -3796,6 +3829,10 @@ class MainWindow(QMainWindow):
         try:
             subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         except Exception as e:
+            try:
+                os.remove(target)      # 启动失败释放占位，序号可被再次使用
+            except OSError:
+                pass
             QMessageBox.warning(self, "无法新开窗口", "启动新实例失败：%s" % e)
             return
         self._append_log(f"已新开窗口（名称 {name}），用于新的目标窗口；可在工具栏「改名」自定义名称。")
